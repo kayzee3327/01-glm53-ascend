@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sgl-glm53-ascend-ops"
+version = "0.1.0"
+description = "Out-of-tree Ascend C operators for GLM-5.3-Flash on SGLang"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.entry-points."sglang.srt.plugins"]
+glm53_ascend_ops = "sgl_glm53_ascend_ops.plugin:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]

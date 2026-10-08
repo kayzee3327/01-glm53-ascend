@@ -1,0 +1,8 @@
+*.so
+*.egg-info/
+__pycache__
+.build_cache/
+build/
+extra-info
+.clangd
+compile_commands.json
