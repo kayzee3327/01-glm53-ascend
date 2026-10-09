@@ -237,10 +237,8 @@ __aicore__ inline void PreparedRecurrent::StoreStateTile(
         copyParams
     );
 
-    // // Ensure MTE3 has finished reading staging
-    // // before the buffer is reused.
-    // AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(1);
-    // AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(1);
+    // Ensure MTE3 has finished reading staging
+    // before the buffer is reused.
 }
 
 __aicore__ inline void PreparedRecurrent::Process()
@@ -276,13 +274,14 @@ __aicore__ inline void PreparedRecurrent::Process()
     if (slot > 0) {
         AscendC::LocalTensor<float> stagingLocal(AscendC::TPosition::VECCALC, UbLayout::UB_END, D * STAGING_STRIDE);
         LoadStateTile(stateLocal, stagingLocal, stateGm, pstate);
-        // AscendC::DataCopy(stateLocal, stateGm[pstate], BV * D);
-        // AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
-        // AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
     } else {
         AscendC::Duplicate(stateLocal, 0.0f, BV * STATE_STRIDE);
     }
     AscendC::PipeBarrier<PIPE_V>();
+
+    // Load Beta into UB first
+    // Avoid GM Load latency and Vector waiting Scalar
+    
 
     for (int32_t token = bos; token < eos; ++token) 
     {

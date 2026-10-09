@@ -115,24 +115,27 @@ def main():
     tokens = 2**10 * 1
     max_mamba_cache_size = 1
     N = max_mamba_cache_size + 1
-    QN = torch.randn([1, tokens, 4, 128], device=device, dtype=torch.float32) * 0.01
-    KN = torch.randn([1, tokens, 4, 128], device=device, dtype=torch.float32) * 0.01
+    requests = 1
+    B = requests
+    H, D = 4, 128
+    BV = 16
+    QN = torch.randn([B, tokens, H, D], device=device, dtype=torch.float32) * 0.01
+    KN = torch.randn([B, tokens, H, D], device=device, dtype=torch.float32) * 0.01
     V = (
-        torch.randn([1, tokens, 4, 128], device=device, dtype=torch.float32) * 0.01
+        torch.randn([B, tokens, H, D], device=device, dtype=torch.float32) * 0.01
     ).to(torch.bfloat16)
     GDECAY = torch.sigmoid(
-        torch.randn([1, tokens, 4, 128], device=device, dtype=torch.float32)
+        torch.randn([B, tokens, H, D], device=device, dtype=torch.float32)
     )
-    BETA = torch.randn([1, tokens, 4], device=device, dtype=torch.float32) * 0.01
-    OUT = torch.empty([1, tokens, 4, 128], device=device, dtype=torch.bfloat16)
-    STATE = torch.randn([N, 4, 128, 128], device=device, dtype=torch.float32) * 0.01
+    BETA = torch.randn([B, tokens, H], device=device, dtype=torch.float32) * 0.01
+    OUT = torch.empty([B, tokens, H, D], device=device, dtype=torch.bfloat16)
+    STATE = torch.randn([N, H, D, D], device=device, dtype=torch.float32) * 0.01
     INDICES = torch.tensor([1], device=device, dtype=torch.int32)
     STARTS = torch.tensor([0, tokens], device=device, dtype=torch.int32)
     TRACK_INDICES = torch.zeros([1], device=device, dtype=torch.int32)
     TRACK_LENS = torch.zeros([1], device=device, dtype=torch.int32)
     TRACK_STATE = False
-    H, D = 4, 128
-    BV = 16
+    
     _, nvec = get_ascend910_core_num()
 
     # grid = (nvec,)
@@ -189,15 +192,15 @@ def main():
             num_stages=3,
             multibuffer=True
         )
-
-    res = benchmark(
-        call_target,
-        references=[Reference("original", call_ref, lambda: OUT_ref.clone())],
-        measurer=NpuEventMeasurer(),
-        config=BenchmarkConfig(10, 400, 20),
-        output_fn=lambda: OUT_target.clone(),
-    )
-    print_result(res)
+    call_target()
+    # res = benchmark(
+    #     call_target,
+    #     references=[Reference("original", call_ref, lambda: OUT_ref.clone())],
+    #     measurer=NpuEventMeasurer(),
+    #     config=BenchmarkConfig(10, 400, 20),
+    #     output_fn=lambda: OUT_target.clone(),
+    # )
+    # print_result(res)
 
 
 if __name__ == "__main__":
