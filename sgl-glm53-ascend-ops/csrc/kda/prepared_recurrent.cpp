@@ -331,7 +331,7 @@ __aicore__ inline void PreparedRecurrent::Process()
         AscendC::PipeBarrier<PIPE_V>();
         ReduceRows128_AS<BV>(tmpBVDLocal, tmpHDLocal, reduceLocal);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Cast(tmpBVLocal, vLocal, AscendC::RoundMode::CAST_RINT, BV);
+        AscendC::Cast(tmpBVLocal, vLocal, AscendC::RoundMode::CAST_NONE, BV);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Sub(tmpBVLocal, tmpBVLocal, reduceLocal, BV);
         AscendC::PipeBarrier<PIPE_V>();
@@ -371,7 +371,7 @@ __aicore__ inline void PreparedRecurrent::Process()
         AscendC::PipeBarrier<PIPE_V>();
 
         // tl.store(OUT + row * D + vs, out.to(OUT.dtype.element_ty))
-        AscendC::Cast(outLocal, reduceLocal, AscendC::RoundMode::CAST_NONE, BV);
+        AscendC::Cast(outLocal, reduceLocal, AscendC::RoundMode::CAST_RINT, BV);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_V_MTE3);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_V_MTE3);
 

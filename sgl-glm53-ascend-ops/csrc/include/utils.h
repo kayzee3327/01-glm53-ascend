@@ -24,6 +24,7 @@ __aicore__ inline void ReduceRows128_AS(
         // Sum tmp[0:64].
         AscendC::WholeReduceSum<float>(dstRow, tmp, 64, 
                                        1, 1, 1, 8);
+        AscendC::PipeBarrier<PIPE_V>();
     }
 }
 
