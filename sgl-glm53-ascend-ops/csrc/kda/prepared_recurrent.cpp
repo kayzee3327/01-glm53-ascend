@@ -195,33 +195,6 @@ __aicore__ inline void PreparedRecurrent::LoadStateTile(
 
         AscendC::TransDataTo5HD<float>(dstList, srcList, params);
     }
-    // AscendC::TransDataTo5HDParams params{};
-    // params.repeatTimes = 16;
-    // params.srcRepStride = 8 * STAGING_STRIDE / 8; // 24 DataBlocks
-    // params.dstRepStride = 1;                     // 8个float
-
-    // uint64_t srcList[16];
-    // uint64_t dstList[16];
-    
-    // #pragma unroll
-    // for (uint32_t i = 0; i < 16; ++i) {
-    //     // 前8项：K=0..7，各取V=0..7
-    //     // 后8项：K=0..7，各取V=8..15
-    //     const uint32_t k = i % 8;
-    //     const uint32_t vBase = (i / 8) * 8;
-    
-    //     srcList[i] = (uint64_t)(
-    //         staging[k * STAGING_STRIDE + vBase].GetPhyAddr());
-        
-    //     // 每对目标地址分别接收：
-    //     // 第c行的8个K、第c+8行的8个K。
-    //     const uint32_t v = i / 2 + (i % 2) * 8;
-        
-    //     dstList[i] = (uint64_t)(
-    //         state[v * STATE_STRIDE].GetPhyAddr());
-    // }
-    
-    // AscendC::TransDataTo5HD<float>(dstList, srcList, params);
 }
 
 __aicore__ inline void PreparedRecurrent::StoreStateTile(
