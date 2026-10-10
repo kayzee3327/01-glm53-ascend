@@ -158,33 +158,60 @@ __aicore__ inline void PreparedRecurrent::LoadStateTile(
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V_S);
 
     // Step 2: UB [128,24] -> UB [16,144]
+    // Step 2: UB [128,24] -> UB [16,144]
     AscendC::TransDataTo5HDParams params{};
     params.repeatTimes = 8;
     params.srcRepStride = 48;
     params.dstRepStride = 2;
 
-    uint64_t srcList[16];
-    uint64_t dstList[16];
-    
+    // Each call processes 8 values of V across 128 values of K.
     #pragma unroll
-    for (uint32_t i = 0; i < 16; ++i) {
-        // 前8项：K=0..7，各取V=0..7
-        // 后8项：K=0..7，各取V=8..15
-        const uint32_t k = i % 8;
-        const uint32_t vBase = (i / 8) * 8;
-    
-        srcList[i] = (uint64_t)(
-            staging[k * STAGING_STRIDE + vBase].GetPhyAddr());
+    for (uint32_t vh = 0; vh < 2; ++vh) {
         
-        // 每对目标地址分别接收：
-        // 第c行的8个K、第c+8行的8个K。
-        const uint32_t v = i / 2 + (i % 2) * 8;
-        
-        dstList[i] = (uint64_t)(
-            state[v * STATE_STRIDE].GetPhyAddr());
+        uint64_t srcList[16];
+        uint64_t dstList[16];
+
+        #pragma unroll
+        for (uint32_t i = 0; i < 16; ++i) {
+            // 16 K rows, each contributing 8 V values.
+            srcList[i] = (uint64_t)(staging[i * STAGING_STRIDE + vh * 8].GetPhyAddr());
+
+            // 8 output V rows, 2 DataBlocks of K per row.
+            const uint32_t v = vh * 8 + i / 2;
+            const uint32_t k = (i % 2) * 8;
+
+            dstList[i] = (uint64_t)(state[v * STATE_STRIDE + k].GetPhyAddr());
+        }
+
+        AscendC::TransDataTo5HD<float>(dstList, srcList, params);
     }
+    // AscendC::TransDataTo5HDParams params{};
+    // params.repeatTimes = 16;
+    // params.srcRepStride = 8 * STAGING_STRIDE / 8; // 24 DataBlocks
+    // params.dstRepStride = 1;                     // 8个float
+
+    // uint64_t srcList[16];
+    // uint64_t dstList[16];
     
-    AscendC::TransDataTo5HD<float>(dstList, srcList, params);
+    // #pragma unroll
+    // for (uint32_t i = 0; i < 16; ++i) {
+    //     // 前8项：K=0..7，各取V=0..7
+    //     // 后8项：K=0..7，各取V=8..15
+    //     const uint32_t k = i % 8;
+    //     const uint32_t vBase = (i / 8) * 8;
+    
+    //     srcList[i] = (uint64_t)(
+    //         staging[k * STAGING_STRIDE + vBase].GetPhyAddr());
+        
+    //     // 每对目标地址分别接收：
+    //     // 第c行的8个K、第c+8行的8个K。
+    //     const uint32_t v = i / 2 + (i % 2) * 8;
+        
+    //     dstList[i] = (uint64_t)(
+    //         state[v * STATE_STRIDE].GetPhyAddr());
+    // }
+    
+    // AscendC::TransDataTo5HD<float>(dstList, srcList, params);
 }
 
 __aicore__ inline void PreparedRecurrent::StoreStateTile(
@@ -309,7 +336,8 @@ __aicore__ inline void PreparedRecurrent::Process()
     AscendC::LocalTensor<float> tmpBVLocal(AscendC::TPosition::VECCALC, tempBVaddr, BV);
     AscendC::LocalTensor<float> tmpBrcbLocal(AscendC::TPosition::VECCALC, tempBrcbAddr, 128);
 
-    constexpr uint64_t tempMulReduceAddr = Align32(tempBrcbAddr + 128* sizeof(float));
+    constexpr uint64_t BANK_PAD = 480;
+    constexpr uint64_t tempMulReduceAddr = Align32(tempBrcbAddr + 128* sizeof(float)) + BANK_PAD;
     AscendC::LocalTensor<float> tmpMulReduceLocal(AscendC::TPosition::VECCALC, tempMulReduceAddr, BV*D /2);
 
 
@@ -428,7 +456,6 @@ __aicore__ inline void PreparedRecurrent::Process()
                                       64, BV, 1, 1, 
                                       8);
                                       
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Cast(tmpBVLocal, vLocal[cur], AscendC::RoundMode::CAST_NONE, BV);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Sub(tmpBVLocal, tmpBVLocal, reduceLocal, BV);
