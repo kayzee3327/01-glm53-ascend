@@ -54,36 +54,46 @@ private:
         static constexpr uint32_t NUM_V_TILES = (D + BV - 1) / BV;
         static constexpr uint32_t NUM_REQ = 1;
         static constexpr uint32_t STAGING_STRIDE = 24;
-        static constexpr uint32_t STATE_STRIDE = 144;
+        static constexpr uint32_t STATE_STRIDE = 128;
     };
 
     struct UbLayout {
-        static constexpr std::uint32_t D = config::D;
-        static constexpr std::uint32_t BV = config::BV;
+        static constexpr uint32_t STATE_ADDR = 0x00000;
+        static constexpr uint32_t STATE_SIZE =
+            config::BV * config::STATE_STRIDE * sizeof(float);
 
-        static constexpr uint32_t STATE_ADDR = 0;
-        static constexpr uint32_t STATE_SIZE = BV * config::STATE_STRIDE * sizeof(float);
+        static constexpr uint32_t Q_SIZE = config::D * sizeof(float);
+        static constexpr uint32_t K_SIZE = Q_SIZE;
+        static constexpr uint32_t DECAY_SIZE = Q_SIZE;
+        static constexpr uint32_t V_SIZE =
+            config::BV * sizeof(bfloat16_t);
+        static constexpr uint32_t OUT_SIZE = V_SIZE;
 
-        static constexpr uint32_t Q0_ADDR = Align32(STATE_ADDR + STATE_SIZE);
-        static constexpr uint32_t Q_SIZE = D * sizeof(float);
-        static constexpr uint32_t Q1_ADDR = Align32(Q0_ADDR + Q_SIZE);
+        static constexpr uint32_t Q0_ADDR     = 0x10100;
+        static constexpr uint32_t Q1_ADDR     = 0x10500;
+        static constexpr uint32_t K0_ADDR     = 0x10900;
+        static constexpr uint32_t K1_ADDR     = 0x10D00;
+        static constexpr uint32_t DECAY0_ADDR = 0x11100;
+        static constexpr uint32_t DECAY1_ADDR = 0x11500;
+        static constexpr uint32_t V0_ADDR     = 0x11900;
+        static constexpr uint32_t V1_ADDR     = 0x11920;
 
-        static constexpr uint32_t K0_ADDR = Align32(Q1_ADDR + Q_SIZE);
-        static constexpr uint32_t K_SIZE = D * sizeof(float);
-        static constexpr uint32_t K1_ADDR = Align32(K0_ADDR + K_SIZE);
+        static constexpr uint32_t BRCB_ADDR       = 0x12000;
+        static constexpr uint32_t REDUCE_ADDR     = 0x12300;
+        static constexpr uint32_t OUT_ADDR        = 0x20000;
+        static constexpr uint32_t MUL_REDUCE_ADDR = 0x20200;
+        static constexpr uint32_t TMP_BV_ADDR     = 0x21440;
 
-        static constexpr uint32_t DECAY0_ADDR = Align32(K1_ADDR + K_SIZE);
-        static constexpr uint32_t DECAY_SIZE = D * sizeof(float);
-        static constexpr uint32_t DECAY1_ADDR = Align32(DECAY0_ADDR + DECAY_SIZE);
+        // 仅在 token 循环前后使用。
+        // 与 MUL_REDUCE / TMP_BV 复用，不能与 OUT 重叠。
+        static constexpr uint32_t STAGING_ADDR = 0x20200;
+        static constexpr uint32_t STAGING_SIZE =
+            config::D * config::STAGING_STRIDE * sizeof(float);
 
-        static constexpr uint32_t V0_ADDR = Align32(DECAY1_ADDR + DECAY_SIZE);
-        static constexpr uint32_t V_SIZE = BV * sizeof(bfloat16_t);
-        static constexpr uint32_t V1_ADDR = Align32(V0_ADDR + V_SIZE);
+        static constexpr uint32_t UB_END =
+            STAGING_ADDR + STAGING_SIZE;
 
-        static constexpr uint32_t OUT_ADDR = Align32(V1_ADDR + V_SIZE);
-        static constexpr uint32_t OUT_SIZE = BV * sizeof(bfloat16_t);
-
-        static constexpr uint32_t UB_END = Align32(OUT_ADDR + OUT_SIZE);
+        static_assert(UB_END <= 192 * 1024);
     };
 
     AscendC::LocalTensor<float> stateLocal;
@@ -220,10 +230,10 @@ __aicore__ inline void PreparedRecurrent::StoreStateTile(
     const AscendC::GlobalTensor<float>& stateGm,
     uint64_t gmOffset)
 {
-    constexpr uint32_t D = 128;
-    constexpr uint32_t BV = 16;
-    constexpr uint32_t STAGING_STRIDE = 24;
-    constexpr uint32_t STATE_STRIDE = 144;
+    constexpr uint32_t D = config::D;
+    constexpr uint32_t BV = config::BV;
+    constexpr uint32_t STAGING_STRIDE = config::STAGING_STRIDE;
+    constexpr uint32_t STATE_STRIDE   = config::STATE_STRIDE;
 
     // Step 1: UB [16,144] -> UB [128,24]
     // Transpose [V,K] -> [K,V]
@@ -315,7 +325,7 @@ __aicore__ inline void PreparedRecurrent::Process()
         + static_cast<uint64_t>(iv*BV);
 
     if (slot > 0) {
-        AscendC::LocalTensor<float> stagingLocal(AscendC::TPosition::VECCALC, UbLayout::UB_END, D * STAGING_STRIDE);
+        AscendC::LocalTensor<float> stagingLocal(AscendC::TPosition::VECCALC, UbLayout::STAGING_ADDR, D * STAGING_STRIDE);
         LoadStateTile(stateLocal, stagingLocal, stateGm, pstate);
     } else {
         AscendC::Duplicate(stateLocal, 0.0f, BV * STATE_STRIDE);
@@ -325,20 +335,21 @@ __aicore__ inline void PreparedRecurrent::Process()
     // Load Beta into UB first
     // Avoid GM Load latency and Vector waiting Scalar
 
-    constexpr uint64_t tempBVDaddr = UbLayout::UB_END;
-    constexpr uint64_t tempHDaddr = Align32(tempBVDaddr + BV * D * sizeof(float));
-    constexpr uint64_t tempReduceAddr = Align32(tempHDaddr + D / 2 * sizeof(float));
-    constexpr uint64_t tempBVaddr = Align32(tempReduceAddr + BV * sizeof(float));
-    constexpr uint64_t tempBrcbAddr = Align32(tempBVaddr + BV * sizeof(float));
-    AscendC::LocalTensor<float> tmpBVDLocal(AscendC::TPosition::VECCALC, tempBVDaddr, BV*D);
-    AscendC::LocalTensor<float> tmpHDLocal(AscendC::TPosition::VECCALC, tempHDaddr, D / 2);
-    AscendC::LocalTensor<float> reduceLocal(AscendC::TPosition::VECCALC, tempReduceAddr, BV);
-    AscendC::LocalTensor<float> tmpBVLocal(AscendC::TPosition::VECCALC, tempBVaddr, BV);
-    AscendC::LocalTensor<float> tmpBrcbLocal(AscendC::TPosition::VECCALC, tempBrcbAddr, 128);
+    AscendC::LocalTensor<float> tmpMulReduceLocal(
+        AscendC::TPosition::VECCALC,
+        UbLayout::MUL_REDUCE_ADDR, BV * D / 2);
 
-    constexpr uint64_t BANK_PAD = 480;
-    constexpr uint64_t tempMulReduceAddr = Align32(tempBrcbAddr + 128* sizeof(float)) + BANK_PAD;
-    AscendC::LocalTensor<float> tmpMulReduceLocal(AscendC::TPosition::VECCALC, tempMulReduceAddr, BV*D /2);
+    AscendC::LocalTensor<float> reduceLocal(
+        AscendC::TPosition::VECCALC,
+        UbLayout::REDUCE_ADDR, BV);
+
+    AscendC::LocalTensor<float> tmpBVLocal(
+        AscendC::TPosition::VECCALC,
+        UbLayout::TMP_BV_ADDR, BV);
+
+    AscendC::LocalTensor<float> tmpBrcbLocal(
+        AscendC::TPosition::VECCALC,
+        UbLayout::BRCB_ADDR, BV * 8);
 
 
     // Prefetch first token into buf[0].
@@ -351,32 +362,19 @@ __aicore__ inline void PreparedRecurrent::Process()
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V_QKVD_0);
     }
 
-    AscendC::BinaryRepeatParams brcb_muladddst_params = {
-        STATE_STRIDE / 8, // dstBlkStride = 18
-        0,               // src0BlkStride: reuse same k block
-        1,               // src1BlkStride: next v broadcast block
-        1,                // dstRepStride: next column block
-        1,               // src0RepStride: next k block
-        0                // src1RepStride: reuse v0..v7
+    AscendC::BinaryRepeatParams decay_params{
+        1, 1, 1,
+        STATE_STRIDE / 8, STATE_STRIDE / 8, 0
     };
 
-    // stride 的单位为 32B，即 8 个 float：
-    // tmp 下一行 +64；state 下一行 +144；x 每行复用。
     AscendC::BinaryRepeatParams mul_reduce_params{
-        1, 
-        1, 
-        1,
-        8, 
-        STATE_STRIDE / 8, 
-        0
+        1, 1, 1,
+        8, STATE_STRIDE / 8, 0
     };
-    AscendC::BinaryRepeatParams decay_params{
-        1, 
-        1, 
-        1,
-        STATE_STRIDE / 8, 
-        STATE_STRIDE / 8, 
-        0
+
+    AscendC::BinaryRepeatParams outer_params{
+        1, 1, 0,
+        STATE_STRIDE / 8, 0, 1
     };
     for (int32_t token = bos; token < eos; ++token)
     {
@@ -470,15 +468,23 @@ __aicore__ inline void PreparedRecurrent::Process()
 
         // state += k[None, :] * v[:, None]
         AscendC::PipeBarrier<PIPE_V>();
-        // Broadcast 16 FP32 values into 16 DataBlocks.
         AscendC::Brcb(tmpBrcbLocal, tmpBVLocal, 2, {1, 8});
         AscendC::PipeBarrier<PIPE_V>();
-        // rows 0..7
-        AscendC::MulAddDst(stateLocal, kLocal[cur], tmpBrcbLocal, 
-                          64, 16, brcb_muladddst_params);
-        // rows 8..15
-        AscendC::MulAddDst(stateLocal[8 * STATE_STRIDE], kLocal[cur], tmpBrcbLocal[8 * 8], 
-                          64, 16, brcb_muladddst_params);
+
+        // 所有16行的前64列。
+        AscendC::MulAddDst(
+            stateLocal,
+            kLocal[cur],
+            tmpBrcbLocal,
+            64, BV, outer_params);
+
+        // 所有16行的后64列。
+        AscendC::MulAddDst(
+            stateLocal[64],
+            kLocal[cur][64],
+            tmpBrcbLocal,
+            64, BV, outer_params);
+
         AscendC::PipeBarrier<PIPE_V>();
 
         // out = tl.sum(state * q[None, :], axis=1)
@@ -522,7 +528,7 @@ __aicore__ inline void PreparedRecurrent::Process()
     }
 
     if (slot > 0) {
-        AscendC::LocalTensor<float> stagingLocal(AscendC::TPosition::VECCALC, UbLayout::UB_END, D * STAGING_STRIDE);
+        AscendC::LocalTensor<float> stagingLocal(AscendC::TPosition::VECCALC, UbLayout::STAGING_ADDR, D * STAGING_STRIDE);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_V_MTE3);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_V_MTE3);
         StoreStateTile(stateLocal, stagingLocal, stateGm, pstate);

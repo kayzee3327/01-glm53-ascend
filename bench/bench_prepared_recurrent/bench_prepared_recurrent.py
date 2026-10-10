@@ -1,7 +1,7 @@
 from benchmark import (
     benchmark,
     BenchmarkConfig,
-    print_result,
+    print_results_table,
     NpuEventMeasurer,
     Reference,
     Comparator,
@@ -101,24 +101,17 @@ class _prepared_recurrent_opt:
 _prepared_recurrent_opt = _prepared_recurrent_opt()
 
 
-def get_ascend910_core_num() -> int:
-    import torch_npu
-    import triton.runtime.driver as driver
-
-    device = torch_npu.npu.current_device()
-    prop = driver.active.utils.get_device_properties(device)
-    cube_core_num, vec_vore_num = prop["num_vectorcore"], prop["num_aicore"]
-    return cube_core_num, vec_vore_num
+TOKEN_COUNTS = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
 
 
-def main():
-    tokens = 2**10 * 1
+def bench_one(tokens: int):
     max_mamba_cache_size = 1
     N = max_mamba_cache_size + 1
     requests = 1
     B = requests
     H, D = 4, 128
     BV = 16
+
     QN = torch.randn([B, tokens, H, D], device=device, dtype=torch.float32) * 0.01
     KN = torch.randn([B, tokens, H, D], device=device, dtype=torch.float32) * 0.01
     V = (
@@ -135,10 +128,7 @@ def main():
     TRACK_INDICES = torch.zeros([1], device=device, dtype=torch.int32)
     TRACK_LENS = torch.zeros([1], device=device, dtype=torch.int32)
     TRACK_STATE = False
-    
-    _, nvec = get_ascend910_core_num()
 
-    # grid = (nvec,)
     grid = (triton.cdiv(D, BV), 1, H)
 
     OUT_ref = OUT.clone().detach()
@@ -148,59 +138,41 @@ def main():
 
     def call_target():
         _prepared_recurrent_opt[grid](
-            QN,
-            KN,
-            V,
-            GDECAY,
-            BETA,
-            OUT_target,
-            STATE_target,
-            INDICES,
-            STARTS,
-            TRACK_INDICES,
-            TRACK_LENS,
-            TRACK_STATE,
-            H,
-            D,
-            BV,
-            *STATE.stride(),
+            QN, KN, V, GDECAY, BETA, OUT_target, STATE_target,
+            INDICES, STARTS, TRACK_INDICES, TRACK_LENS,
+            TRACK_STATE, H, D, BV, *STATE.stride(),
         )
-
-    BV_ref = 16
-    grid_ref = (triton.cdiv(D, BV), 1, H)
 
     def call_ref():
-
-        _prepared_recurrent[grid_ref](
-            QN,
-            KN,
-            V,
-            GDECAY,
-            BETA,
-            OUT_ref,
-            STATE_ref,
-            INDICES,
-            STARTS,
-            TRACK_INDICES,
-            TRACK_LENS,
-            TRACK_STATE,
-            H,
-            D,
-            BV_ref,
-            *STATE.stride(),
-            num_warps=1,
-            num_stages=3,
-            multibuffer=True
+        _prepared_recurrent[grid](
+            QN, KN, V, GDECAY, BETA, OUT_ref, STATE_ref,
+            INDICES, STARTS, TRACK_INDICES, TRACK_LENS,
+            TRACK_STATE, H, D, BV, *STATE.stride(),
+            num_warps=1, num_stages=3, multibuffer=True,
         )
-    call_target()
-    # res = benchmark(
-    #     call_target,
-    #     references=[Reference("original", call_ref, lambda: OUT_ref.clone())],
-    #     measurer=NpuEventMeasurer(),
-    #     config=BenchmarkConfig(10, 400, 20),
-    #     output_fn=lambda: OUT_target.clone(),
-    # )
-    # print_result(res)
+
+    return benchmark(
+        call_target,
+        references=[Reference("triton", call_ref, lambda: OUT_ref.clone())],
+        measurer=NpuEventMeasurer(),
+        config=BenchmarkConfig(10, 20, 20),
+        output_fn=lambda: OUT_target.clone(),
+    )
+
+
+def main():
+    results = []
+    for tokens in TOKEN_COUNTS:
+        label = f"{tokens // 1024}k" if tokens >= 1024 else str(tokens)
+        print(f">>> benchmarking tokens={label} ...")
+        res = bench_one(tokens)
+        results.append((label, res))
+
+    print()
+    print("=" * 60)
+    print("prepared_recurrent — ascend_c (target) vs triton (ref)")
+    print("=" * 60)
+    print_results_table(results)
 
 
 if __name__ == "__main__":
