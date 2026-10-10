@@ -163,27 +163,28 @@ __aicore__ inline void PreparedRecurrent::LoadStateTile(
     params.srcRepStride = 48;
     params.dstRepStride = 2;
 
-    // Each call processes 8 values of V across 128 values of K.
+    uint64_t srcList[16];
+    uint64_t dstList[16];
+    
     #pragma unroll
-    for (uint32_t vh = 0; vh < 2; ++vh) {
+    for (uint32_t i = 0; i < 16; ++i) {
+        // 前8项：K=0..7，各取V=0..7
+        // 后8项：K=0..7，各取V=8..15
+        const uint32_t k = i % 8;
+        const uint32_t vBase = (i / 8) * 8;
+    
+        srcList[i] = (uint64_t)(
+            staging[k * STAGING_STRIDE + vBase].GetPhyAddr());
         
-        uint64_t srcList[16];
-        uint64_t dstList[16];
-
-        #pragma unroll
-        for (uint32_t i = 0; i < 16; ++i) {
-            // 16 K rows, each contributing 8 V values.
-            srcList[i] = (uint64_t)(staging[i * STAGING_STRIDE + vh * 8].GetPhyAddr());
-
-            // 8 output V rows, 2 DataBlocks of K per row.
-            const uint32_t v = vh * 8 + i / 2;
-            const uint32_t k = (i % 2) * 8;
-
-            dstList[i] = (uint64_t)(state[v * STATE_STRIDE + k].GetPhyAddr());
-        }
-
-        AscendC::TransDataTo5HD<float>(dstList, srcList, params);
+        // 每对目标地址分别接收：
+        // 第c行的8个K、第c+8行的8个K。
+        const uint32_t v = i / 2 + (i % 2) * 8;
+        
+        dstList[i] = (uint64_t)(
+            state[v * STATE_STRIDE].GetPhyAddr());
     }
+    
+    AscendC::TransDataTo5HD<float>(dstList, srcList, params);
 }
 
 __aicore__ inline void PreparedRecurrent::StoreStateTile(
@@ -298,15 +299,19 @@ __aicore__ inline void PreparedRecurrent::Process()
     // Avoid GM Load latency and Vector waiting Scalar
 
     constexpr uint64_t tempBVDaddr = UbLayout::UB_END;
-    constexpr uint64_t tempHDaddr = tempBVDaddr + BV * D * sizeof(float);
-    constexpr uint64_t tempReduceAddr = tempHDaddr + D / 2 * sizeof(float);
-    constexpr uint64_t tempBVaddr = tempReduceAddr + BV * sizeof(float);
-    constexpr uint64_t tempBrcbAddr = tempBVaddr + BV * sizeof(float);
+    constexpr uint64_t tempHDaddr = Align32(tempBVDaddr + BV * D * sizeof(float));
+    constexpr uint64_t tempReduceAddr = Align32(tempHDaddr + D / 2 * sizeof(float));
+    constexpr uint64_t tempBVaddr = Align32(tempReduceAddr + BV * sizeof(float));
+    constexpr uint64_t tempBrcbAddr = Align32(tempBVaddr + BV * sizeof(float));
     AscendC::LocalTensor<float> tmpBVDLocal(AscendC::TPosition::VECCALC, tempBVDaddr, BV*D);
     AscendC::LocalTensor<float> tmpHDLocal(AscendC::TPosition::VECCALC, tempHDaddr, D / 2);
     AscendC::LocalTensor<float> reduceLocal(AscendC::TPosition::VECCALC, tempReduceAddr, BV);
     AscendC::LocalTensor<float> tmpBVLocal(AscendC::TPosition::VECCALC, tempBVaddr, BV);
     AscendC::LocalTensor<float> tmpBrcbLocal(AscendC::TPosition::VECCALC, tempBrcbAddr, 128);
+
+    constexpr uint64_t tempMulReduceAddr = Align32(tempBrcbAddr + 128* sizeof(float));
+    AscendC::LocalTensor<float> tmpMulReduceLocal(AscendC::TPosition::VECCALC, tempMulReduceAddr, BV*D /2);
+
 
     // Prefetch first token into buf[0].
     if (bos < eos) {
@@ -318,6 +323,33 @@ __aicore__ inline void PreparedRecurrent::Process()
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V_QKVD_0);
     }
 
+    AscendC::BinaryRepeatParams brcb_muladddst_params = {
+        STATE_STRIDE / 8, // dstBlkStride = 18
+        0,               // src0BlkStride: reuse same k block
+        1,               // src1BlkStride: next v broadcast block
+        1,                // dstRepStride: next column block
+        1,               // src0RepStride: next k block
+        0                // src1RepStride: reuse v0..v7
+    };
+
+    // stride 的单位为 32B，即 8 个 float：
+    // tmp 下一行 +64；state 下一行 +144；x 每行复用。
+    AscendC::BinaryRepeatParams mul_reduce_params{
+        1, 
+        1, 
+        1,
+        8, 
+        STATE_STRIDE / 8, 
+        0
+    };
+    AscendC::BinaryRepeatParams decay_params{
+        1, 
+        1, 
+        1,
+        STATE_STRIDE / 8, 
+        STATE_STRIDE / 8, 
+        0
+    };
     for (int32_t token = bos; token < eos; ++token)
     {
         bool pos2 = token > bos;
@@ -361,22 +393,41 @@ __aicore__ inline void PreparedRecurrent::Process()
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(cur_buf_e);
 
         // state *= decay[None, :]
-        #pragma unroll
-        for (uint32_t j = 0; j < BV; ++j) {
-            auto stateRow = stateLocal[j * STATE_STRIDE];
-            AscendC::Mul(stateRow, stateRow, decayLocal[cur], D);
-        }
+        //////////////////////////////////////////
+        // #pragma unroll
+        // for (uint32_t j = 0; j < BV; ++j) {
+        //     auto stateRow = stateLocal[j * STATE_STRIDE];
+        //     AscendC::Mul(stateRow, stateRow, decayLocal[cur], D);
+        // }
+        // AscendC::PipeBarrier<PIPE_V>();
+        //////////////////////////////////////////
+        AscendC::Mul(
+            stateLocal, stateLocal, decayLocal[cur],
+            64, BV, decay_params);
+        AscendC::Mul(
+            stateLocal[64], stateLocal[64], decayLocal[cur][64],
+            64, BV, decay_params);
         AscendC::PipeBarrier<PIPE_V>();
 
         // v -= tl.sum(state * k[None, :], axis=1)
-        #pragma unroll
-        for (uint32_t j = 0; j < BV; ++j) {
-            auto stateRow = stateLocal[j * STATE_STRIDE];
-            auto tempRow = tmpBVDLocal[j * D];
-            AscendC::Mul(tempRow, stateRow, kLocal[cur], D);
-        }
+        //////////////////////////////////////////
+        // #pragma unroll
+        // for (uint32_t j = 0; j < BV; ++j) {
+            // auto stateRow = stateLocal[j * STATE_STRIDE];
+            // auto tempRow = tmpBVDLocal[j * D];
+            // AscendC::Mul(tempRow, stateRow, kLocal[cur], D);
+        // }
+        // AscendC::PipeBarrier<PIPE_V>();
+        // ReduceRows128_AS<BV>(tmpBVDLocal, tmpHDLocal, reduceLocal);
+        //////////////////////////////////////////
+        AscendC::Mul(tmpMulReduceLocal, stateLocal, kLocal[cur], 64, BV, mul_reduce_params);
         AscendC::PipeBarrier<PIPE_V>();
-        ReduceRows128_AS<BV>(tmpBVDLocal, tmpHDLocal, reduceLocal);
+        AscendC::MulAddDst(tmpMulReduceLocal, stateLocal[64], kLocal[cur][64], 64, BV, mul_reduce_params);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::WholeReduceSum<float>(reduceLocal, tmpMulReduceLocal, 
+                                      64, BV, 1, 1, 
+                                      8);
+                                      
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Cast(tmpBVLocal, vLocal[cur], AscendC::RoundMode::CAST_NONE, BV);
         AscendC::PipeBarrier<PIPE_V>();
@@ -384,42 +435,44 @@ __aicore__ inline void PreparedRecurrent::Process()
         AscendC::PipeBarrier<PIPE_V>();
 
         // v *= beta
-        // state += k[None, :] * v[:, None]
-        // v *= beta
         AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_S_V);
         AscendC::Muls(tmpBVLocal, tmpBVLocal, betaValue, BV);
         if (posn_1) {
             AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_V_S_BETA);
         }
+
+        // state += k[None, :] * v[:, None]
         AscendC::PipeBarrier<PIPE_V>();
         // Broadcast 16 FP32 values into 16 DataBlocks.
         AscendC::Brcb(tmpBrcbLocal, tmpBVLocal, 2, {1, 8});
         AscendC::PipeBarrier<PIPE_V>();
-        // state[v, k] += v[v] * k[k]
-        AscendC::BinaryRepeatParams params = {
-            STATE_STRIDE / 8, // dstBlkStride = 18
-            0,               // src0BlkStride: reuse same k block
-            1,               // src1BlkStride: next v broadcast block
-            1,                // dstRepStride: next column block
-            1,               // src0RepStride: next k block
-            0                // src1RepStride: reuse v0..v7
-        };
         // rows 0..7
-        AscendC::MulAddDst(stateLocal, kLocal[cur], tmpBrcbLocal, 64, 16, params);
+        AscendC::MulAddDst(stateLocal, kLocal[cur], tmpBrcbLocal, 
+                          64, 16, brcb_muladddst_params);
         // rows 8..15
-        AscendC::MulAddDst(stateLocal[8 * STATE_STRIDE], kLocal[cur], tmpBrcbLocal[8 * 8], 64, 16, params);
+        AscendC::MulAddDst(stateLocal[8 * STATE_STRIDE], kLocal[cur], tmpBrcbLocal[8 * 8], 
+                          64, 16, brcb_muladddst_params);
         AscendC::PipeBarrier<PIPE_V>();
 
         // out = tl.sum(state * q[None, :], axis=1)
-        #pragma unroll
-        for (uint32_t j = 0; j < BV; ++j) {
-            auto stateRow = stateLocal[j * STATE_STRIDE];
-            auto tempRow = tmpBVDLocal[j * D];
-            AscendC::Mul(tempRow, stateRow, qLocal[cur], D);
-        }
+        //////////////////////////////////////////
+        // #pragma unroll
+        // for (uint32_t j = 0; j < BV; ++j) {
+        //     auto stateRow = stateLocal[j * STATE_STRIDE];
+        //     auto tempRow = tmpBVDLocal[j * D];
+        //     AscendC::Mul(tempRow, stateRow, qLocal[cur], D);
+        // }
+        // AscendC::PipeBarrier<PIPE_V>();
+        // ReduceRows128_AS<BV>(tmpBVDLocal, tmpHDLocal, reduceLocal);
+        // AscendC::PipeBarrier<PIPE_V>();
+        //////////////////////////////////////////
+        AscendC::Mul(tmpMulReduceLocal, stateLocal, qLocal[cur], 64, BV, mul_reduce_params);
         AscendC::PipeBarrier<PIPE_V>();
-        ReduceRows128_AS<BV>(tmpBVDLocal, tmpHDLocal, reduceLocal);
+        AscendC::MulAddDst(tmpMulReduceLocal, stateLocal[64], qLocal[cur][64], 64, BV, mul_reduce_params);
         AscendC::PipeBarrier<PIPE_V>();
+        AscendC::WholeReduceSum<float>(reduceLocal, tmpMulReduceLocal, 
+                                      64, BV, 1, 1, 
+                                      8);
 
         // Signal that Vector is done reading buf[cur].
         // The next iteration's prefetch (into buf[cur]) will wait for this.
@@ -428,12 +481,12 @@ __aicore__ inline void PreparedRecurrent::Process()
         }
 
         // tl.store(OUT + row * D + vs, out.to(OUT.dtype.element_ty))
-        AscendC::Cast(outLocal, reduceLocal, AscendC::RoundMode::CAST_RINT, BV);
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_V_MTE3);
-        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_V_MTE3);
         if (pos2) {
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_MTE3_V);
         }
+        AscendC::Cast(outLocal, reduceLocal, AscendC::RoundMode::CAST_RINT, BV);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_V_MTE3);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_V_MTE3);
         AscendC::DataCopy(outGm[row * D + iv * BV], outLocal, BV);
         if (posn_1) {
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_MTE3_V);
