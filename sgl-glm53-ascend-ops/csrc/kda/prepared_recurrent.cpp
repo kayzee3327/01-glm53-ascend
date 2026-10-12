@@ -21,8 +21,10 @@ constexpr int32_t EVENT_V_S_BETA = 0;
 constexpr int32_t EVENT_S_V = 2;
 constexpr int32_t EVENT_V_MTE2 = 3;
 constexpr int32_t EVENT_MTE3_V = 4;
+constexpr int32_t EVENT_MTE3_V_TRACK = 0;
 constexpr int32_t EVENT_V_MTE3 = 5;
 
+template<bool TRACK_STATE>
 class PreparedRecurrent {
 public: 
     __aicore__ inline void Init(
@@ -32,7 +34,9 @@ public:
         GM_ADDR OUT,                    // bf16
         GM_ADDR STATE,                  // fp32
         GM_ADDR INDICES,                // int32/int64
-        GM_ADDR STARTS                  // int32
+        GM_ADDR STARTS,                // int32
+        GM_ADDR TRACK_INDICES, 
+        GM_ADDR TRACK_LENS
     );
     __aicore__ inline void Process();
 private:
@@ -113,12 +117,18 @@ private:
         const AscendC::LocalTensor<float>& staging,
         const AscendC::GlobalTensor<float>& stateGm,
         uint64_t gmOffset);
+
+    AscendC::GlobalTensor<int32_t> trackIndicesGm;
+    AscendC::GlobalTensor<int32_t> trackLensGm;
+    __aicore__ inline void SaveTrackedState(uint64_t gmOffset);
 };
 
-__aicore__ inline void PreparedRecurrent::Init(
+template<bool TRACK_STATE>
+__aicore__ inline void PreparedRecurrent<TRACK_STATE>::Init(
     GM_ADDR QN, GM_ADDR KN, GM_ADDR V, 
     GM_ADDR GDECAY, GM_ADDR BETA, GM_ADDR OUT, 
-    GM_ADDR STATE, GM_ADDR INDICES, GM_ADDR STARTS) 
+    GM_ADDR STATE, GM_ADDR INDICES, GM_ADDR STARTS, 
+    GM_ADDR TRACK_INDICES, GM_ADDR TRACK_LENS) 
 {
     qnGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(QN));
     knGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(KN));
@@ -129,6 +139,12 @@ __aicore__ inline void PreparedRecurrent::Init(
     stateGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(STATE));
     indicesGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(INDICES));
     startsGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(STARTS));
+    if constexpr (TRACK_STATE) {
+        trackIndicesGm.SetGlobalBuffer(
+            reinterpret_cast<__gm__ int32_t*>(TRACK_INDICES));
+        trackLensGm.SetGlobalBuffer(
+            reinterpret_cast<__gm__ int32_t*>(TRACK_LENS));
+    }
 
     constexpr uint32_t BV = config::BV;
     constexpr uint32_t D = config::D;
@@ -145,7 +161,8 @@ __aicore__ inline void PreparedRecurrent::Init(
     outLocal = AscendC::LocalTensor<bfloat16_t>(AscendC::TPosition::VECCALC, UbLayout::OUT_ADDR, BV);
 }
 
-__aicore__ inline void PreparedRecurrent::LoadStateTile(
+template<bool TRACK_STATE>
+__aicore__ inline void PreparedRecurrent<TRACK_STATE>::LoadStateTile(
     const AscendC::LocalTensor<float>& state,
     const AscendC::LocalTensor<float>& staging,
     const AscendC::GlobalTensor<float>& stateGm,
@@ -197,7 +214,8 @@ __aicore__ inline void PreparedRecurrent::LoadStateTile(
     }
 }
 
-__aicore__ inline void PreparedRecurrent::StoreStateTile(
+template<bool TRACK_STATE>
+__aicore__ inline void PreparedRecurrent<TRACK_STATE>::StoreStateTile(
     const AscendC::LocalTensor<float>& state,
     const AscendC::LocalTensor<float>& staging,
     const AscendC::GlobalTensor<float>& stateGm,
@@ -267,7 +285,28 @@ __aicore__ inline void PreparedRecurrent::StoreStateTile(
     // before the buffer is reused.
 }
 
-__aicore__ inline void PreparedRecurrent::Process()
+
+template<bool TRACK_STATE>
+__aicore__ inline void
+PreparedRecurrent<TRACK_STATE>::SaveTrackedState(uint64_t gmOffset)
+{
+    AscendC::LocalTensor<float> stagingLocal(
+        AscendC::TPosition::VECCALC,
+        UbLayout::STAGING_ADDR,
+        config::D * config::STAGING_STRIDE);
+
+    // 内部已有 PIPE_V 屏障、转置以及 V_MTE3 同步。
+    StoreStateTile(stateLocal, stagingLocal, stateGm, gmOffset);
+
+    // MTE3 读完 staging 后，Vector 才能覆盖复用区域。
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(
+        EVENT_MTE3_V_TRACK);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(
+        EVENT_MTE3_V_TRACK);
+}
+
+template<bool TRACK_STATE>
+__aicore__ inline void PreparedRecurrent<TRACK_STATE>::Process()
 {
     AscendC::InitSocState();
 
@@ -304,6 +343,26 @@ __aicore__ inline void PreparedRecurrent::Process()
         AscendC::Duplicate(stateLocal, 0.0f, BV * STATE_STRIDE);
     }
     AscendC::PipeBarrier<PIPE_V>();
+
+    int32_t trackSlot = 0;
+    int32_t trackLen = 0;
+    uint64_t ptrack = 0;
+
+    if constexpr (TRACK_STATE) {
+        trackSlot = trackIndicesGm.GetValue(req);
+        trackLen = trackLensGm.GetValue(req);
+
+        if (trackSlot > 0) {
+            // 与当前 pstate 相同的 GM 布局：[slot, head, K, V]
+            ptrack =
+                (static_cast<uint64_t>(trackSlot) * H + head) * D * D
+                + static_cast<uint64_t>(iv) * BV;
+
+            if (trackLen == 0) {
+                SaveTrackedState(ptrack);
+            }
+        }
+    }
 
     // Load Beta into UB first
     // Avoid GM Load latency and Vector waiting Scalar
@@ -490,6 +549,13 @@ __aicore__ inline void PreparedRecurrent::Process()
         if (pos2) {
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_MTE3_V);
         }
+        if constexpr (TRACK_STATE) {
+            if (trackSlot > 0 &&
+                static_cast<int64_t>(token) - bos + 1 == trackLen) {
+                SaveTrackedState(ptrack);
+            }
+        }
+
         AscendC::Cast(outLocal, reduceLocal, AscendC::RoundMode::CAST_RINT, BV);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_V_MTE3);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_V_MTE3);
@@ -522,14 +588,42 @@ void prepared_recurrent_kernel(
     GM_ADDR TRACK_INDICES,          // int32/int64
     GM_ADDR TRACK_LENS              // int32/int64
 ) {
-    PreparedRecurrent op;
+    PreparedRecurrent<false> op;
     op.Init(QN, KN,         // fp32
             V,                      // bf16
             GDECAY, BETA,   // fp32
             OUT,                    // bf16
             STATE,                  // fp32
             INDICES,                // int32/int64
-            STARTS                 // int32
+            STARTS,                 // int32
+            TRACK_INDICES,
+            TRACK_LENS
+    );
+    op.Process();
+}
+
+extern "C" __global__ __vector__
+void prepared_recurrent_kernel_track(
+    GM_ADDR QN, GM_ADDR KN,         // fp32
+    GM_ADDR V,                      // bf16
+    GM_ADDR GDECAY, GM_ADDR BETA,   // fp32
+    GM_ADDR OUT,                    // bf16
+    GM_ADDR STATE,                  // fp32
+    GM_ADDR INDICES,                // int32/int64
+    GM_ADDR STARTS,                 // int32
+    GM_ADDR TRACK_INDICES,          // int32/int64
+    GM_ADDR TRACK_LENS              // int32/int64
+) {
+    PreparedRecurrent<true> op;
+    op.Init(QN, KN,         // fp32
+            V,                      // bf16
+            GDECAY, BETA,   // fp32
+            OUT,                    // bf16
+            STATE,                  // fp32
+            INDICES,                // int32/int64
+            STARTS,                 // int32
+            TRACK_INDICES,
+            TRACK_LENS
     );
     op.Process();
 }
@@ -547,38 +641,86 @@ void prepared_recurrent(
     at::Tensor &out,
     at::Tensor &state,
     const at::Tensor &indices,
-    const at::Tensor &starts)
+    const at::Tensor &starts,
+    const c10::optional<at::Tensor> &track_indices,
+    const c10::optional<at::Tensor> &track_lens,
+    bool track_state)
 {
     TORCH_CHECK(qn.is_privateuseone(), "qn must be an NPU tensor");
     TORCH_CHECK(kn.is_privateuseone(), "kn must be an NPU tensor");
     TORCH_CHECK(v.is_privateuseone(),  "v must be an NPU tensor");
 
-    constexpr int32_t H  = 4;
-    constexpr int32_t D  = 128;
+    constexpr int32_t H = 4;
+    constexpr int32_t D = 128;
     constexpr int32_t BV = 16;
+    constexpr int32_t NUM_REQ = 1;  // 与当前 device config 一致
     constexpr int32_t NUM_V_TILES = (D + BV - 1) / BV;
-    constexpr int32_t blockDim = NUM_V_TILES * H;
+    constexpr int32_t blockDim = NUM_V_TILES * NUM_REQ * H;
+
+    auto gm = [](const at::Tensor &tensor) -> uint8_t* {
+        return reinterpret_cast<uint8_t*>(
+            const_cast<void*>(tensor.data_ptr()));
+    };
+
+    uint8_t *trackIndicesPtr = nullptr;
+    uint8_t *trackLensPtr = nullptr;
+
+    if (track_state) {
+        TORCH_CHECK(
+            track_indices.has_value() && track_indices->defined(),
+            "track_indices is required when track_state=True");
+        TORCH_CHECK(
+            track_lens.has_value() && track_lens->defined(),
+            "track_lens is required when track_state=True");
+
+        auto checkTrackTensor = [&](const at::Tensor &tensor,
+                                    const char *name) {
+            TORCH_CHECK(
+                tensor.device() == qn.device(),
+                name, " must be on the same device as qn");
+            TORCH_CHECK(
+                tensor.scalar_type() == at::kInt,
+                name, " must be int32");
+            TORCH_CHECK(
+                tensor.is_contiguous(),
+                name, " must be contiguous");
+            TORCH_CHECK(
+                tensor.numel() >= NUM_REQ,
+                name, " must contain at least ", NUM_REQ, " elements");
+        };
+
+        checkTrackTensor(*track_indices, "track_indices");
+        checkTrackTensor(*track_lens, "track_lens");
+
+        trackIndicesPtr = gm(*track_indices);
+        trackLensPtr = gm(*track_lens);
+    }
 
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     // printf("start\n");
-    prepared_recurrent_kernel<<<blockDim, nullptr, stream>>>(
-        reinterpret_cast<uint8_t *>(const_cast<void *>(qn.data_ptr())),
-        reinterpret_cast<uint8_t *>(const_cast<void *>(kn.data_ptr())),
-        reinterpret_cast<uint8_t *>(const_cast<void *>(v.data_ptr())),
-        reinterpret_cast<uint8_t *>(const_cast<void *>(gdecay.data_ptr())),
-        reinterpret_cast<uint8_t *>(const_cast<void *>(beta.data_ptr())),
-        reinterpret_cast<uint8_t *>(out.data_ptr()),
-        reinterpret_cast<uint8_t *>(state.data_ptr()),
-        reinterpret_cast<uint8_t *>(const_cast<void *>(indices.data_ptr())),
-        reinterpret_cast<uint8_t *>(const_cast<void *>(starts.data_ptr())),
-        nullptr,
-        nullptr);
+    if (track_state) {
+        prepared_recurrent_kernel_track<<<blockDim, nullptr, stream>>>(
+            gm(qn), gm(kn), gm(v),
+            gm(gdecay), gm(beta),
+            gm(out), gm(state),
+            gm(indices), gm(starts),
+            trackIndicesPtr, trackLensPtr);
+    } else {
+        prepared_recurrent_kernel<<<blockDim, nullptr, stream>>>(
+            gm(qn), gm(kn), gm(v),
+            gm(gdecay), gm(beta),
+            gm(out), gm(state),
+            gm(indices), gm(starts),
+            nullptr, nullptr);
+    }
 }
 
 TORCH_LIBRARY_FRAGMENT(sgl_glm53_ascend, m) {
     m.def("prepared_recurrent(Tensor qn, Tensor kn, Tensor v, "
           "Tensor gdecay, Tensor beta, Tensor(a!) out, Tensor(b!) state, "
-          "Tensor indices, Tensor starts) -> ()");
+          "Tensor indices, Tensor starts, "
+          "Tensor? track_indices=None, Tensor? track_lens=None, "
+          "bool track_state=False) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(sgl_glm53_ascend, PrivateUse1, m) {

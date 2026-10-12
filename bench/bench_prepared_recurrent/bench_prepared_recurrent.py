@@ -95,6 +95,9 @@ class _prepared_recurrent_opt:
         _prepared_recurrent_torch(
             qn=QN, kn=KN, v=V, gdecay=GDECAY, beta=BETA,
             out=OUT, state=STATE, indices=INDICES, starts=STARTS,
+            track_indices=TRACK_INDICES if TRACK_STATE else None,
+            track_lens=TRACK_LENS if TRACK_STATE else None,
+            track_state=TRACK_STATE,
         )
 
 
@@ -104,9 +107,8 @@ _prepared_recurrent_opt = _prepared_recurrent_opt()
 TOKEN_COUNTS = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
 
 
-def bench_one(tokens: int):
-    max_mamba_cache_size = 1
-    N = max_mamba_cache_size + 1
+def bench_one(tokens: int, track_state: bool = False):
+    N = 3 if track_state else 2
     requests = 1
     B = requests
     H, D = 4, 128
@@ -125,9 +127,15 @@ def bench_one(tokens: int):
     STATE = torch.randn([N, H, D, D], device=device, dtype=torch.float32) * 0.01
     INDICES = torch.tensor([1], device=device, dtype=torch.int32)
     STARTS = torch.tensor([0, tokens], device=device, dtype=torch.int32)
-    TRACK_INDICES = torch.zeros([1], device=device, dtype=torch.int32)
-    TRACK_LENS = torch.zeros([1], device=device, dtype=torch.int32)
-    TRACK_STATE = False
+
+    if track_state:
+        TRACK_INDICES = torch.tensor([2], device=device, dtype=torch.int32)
+        TRACK_LENS = torch.tensor([tokens // 2], device=device, dtype=torch.int32)
+    else:
+        TRACK_INDICES = torch.zeros([1], device=device, dtype=torch.int32)
+        TRACK_LENS = torch.zeros([1], device=device, dtype=torch.int32)
+
+    TRACK_STATE = track_state
 
     grid = (triton.cdiv(D, BV), 1, H)
 
@@ -153,10 +161,10 @@ def bench_one(tokens: int):
 
     return benchmark(
         call_target,
-        references=[Reference("triton", call_ref, lambda: OUT_ref.clone())],
+        references=[Reference("triton", call_ref, lambda: (OUT_ref.clone(), STATE_ref.clone()))],
         measurer=NpuEventMeasurer(),
         config=BenchmarkConfig(10, 20, 20),
-        output_fn=lambda: OUT_target.clone(),
+        output_fn=lambda: (OUT_target.clone(), STATE_target.clone()),
     )
 
 
@@ -164,15 +172,28 @@ def main():
     results = []
     for tokens in TOKEN_COUNTS:
         label = f"{tokens // 1024}k" if tokens >= 1024 else str(tokens)
-        print(f">>> benchmarking tokens={label} ...")
-        res = bench_one(tokens)
+        print(f">>> benchmarking tokens={label} (no tracking) ...")
+        res = bench_one(tokens, track_state=False)
         results.append((label, res))
 
     print()
     print("=" * 60)
-    print("prepared_recurrent — ascend_c (target) vs triton (ref)")
+    print("prepared_recurrent (no tracking) — ascend_c vs triton")
     print("=" * 60)
     print_results_table(results)
+
+    results_track = []
+    for tokens in TOKEN_COUNTS:
+        label = f"{tokens // 1024}k" if tokens >= 1024 else str(tokens)
+        print(f">>> benchmarking tokens={label} (track_state) ...")
+        res = bench_one(tokens, track_state=True)
+        results_track.append((label, res))
+
+    print()
+    print("=" * 60)
+    print("prepared_recurrent (track_state) — ascend_c vs triton")
+    print("=" * 60)
+    print_results_table(results_track)
 
 
 if __name__ == "__main__":
