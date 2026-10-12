@@ -24,7 +24,7 @@ constexpr int32_t EVENT_MTE3_V = 4;
 constexpr int32_t EVENT_MTE3_V_TRACK = 0;
 constexpr int32_t EVENT_V_MTE3 = 5;
 
-template<bool TRACK_STATE>
+template<bool TRACK_STATE, uint32_t HEAD_OFFSET, uint32_t H_TOTAL>
 class PreparedRecurrent {
 public: 
     __aicore__ inline void Init(
@@ -123,12 +123,12 @@ private:
     __aicore__ inline void SaveTrackedState(uint64_t gmOffset);
 };
 
-template<bool TRACK_STATE>
-__aicore__ inline void PreparedRecurrent<TRACK_STATE>::Init(
-    GM_ADDR QN, GM_ADDR KN, GM_ADDR V, 
-    GM_ADDR GDECAY, GM_ADDR BETA, GM_ADDR OUT, 
-    GM_ADDR STATE, GM_ADDR INDICES, GM_ADDR STARTS, 
-    GM_ADDR TRACK_INDICES, GM_ADDR TRACK_LENS) 
+template<bool TRACK_STATE, uint32_t HEAD_OFFSET, uint32_t H_TOTAL>
+__aicore__ inline void PreparedRecurrent<TRACK_STATE, HEAD_OFFSET, H_TOTAL>::Init(
+    GM_ADDR QN, GM_ADDR KN, GM_ADDR V,
+    GM_ADDR GDECAY, GM_ADDR BETA, GM_ADDR OUT,
+    GM_ADDR STATE, GM_ADDR INDICES, GM_ADDR STARTS,
+    GM_ADDR TRACK_INDICES, GM_ADDR TRACK_LENS)
 {
     qnGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(QN));
     knGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(KN));
@@ -161,8 +161,8 @@ __aicore__ inline void PreparedRecurrent<TRACK_STATE>::Init(
     outLocal = AscendC::LocalTensor<bfloat16_t>(AscendC::TPosition::VECCALC, UbLayout::OUT_ADDR, BV);
 }
 
-template<bool TRACK_STATE>
-__aicore__ inline void PreparedRecurrent<TRACK_STATE>::LoadStateTile(
+template<bool TRACK_STATE, uint32_t HEAD_OFFSET, uint32_t H_TOTAL>
+__aicore__ inline void PreparedRecurrent<TRACK_STATE, HEAD_OFFSET, H_TOTAL>::LoadStateTile(
     const AscendC::LocalTensor<float>& state,
     const AscendC::LocalTensor<float>& staging,
     const AscendC::GlobalTensor<float>& stateGm,
@@ -214,8 +214,8 @@ __aicore__ inline void PreparedRecurrent<TRACK_STATE>::LoadStateTile(
     }
 }
 
-template<bool TRACK_STATE>
-__aicore__ inline void PreparedRecurrent<TRACK_STATE>::StoreStateTile(
+template<bool TRACK_STATE, uint32_t HEAD_OFFSET, uint32_t H_TOTAL>
+__aicore__ inline void PreparedRecurrent<TRACK_STATE, HEAD_OFFSET, H_TOTAL>::StoreStateTile(
     const AscendC::LocalTensor<float>& state,
     const AscendC::LocalTensor<float>& staging,
     const AscendC::GlobalTensor<float>& stateGm,
@@ -286,9 +286,9 @@ __aicore__ inline void PreparedRecurrent<TRACK_STATE>::StoreStateTile(
 }
 
 
-template<bool TRACK_STATE>
+template<bool TRACK_STATE, uint32_t HEAD_OFFSET, uint32_t H_TOTAL>
 __aicore__ inline void
-PreparedRecurrent<TRACK_STATE>::SaveTrackedState(uint64_t gmOffset)
+PreparedRecurrent<TRACK_STATE, HEAD_OFFSET, H_TOTAL>::SaveTrackedState(uint64_t gmOffset)
 {
     AscendC::LocalTensor<float> stagingLocal(
         AscendC::TPosition::VECCALC,
@@ -305,15 +305,14 @@ PreparedRecurrent<TRACK_STATE>::SaveTrackedState(uint64_t gmOffset)
         EVENT_MTE3_V_TRACK);
 }
 
-template<bool TRACK_STATE>
-__aicore__ inline void PreparedRecurrent<TRACK_STATE>::Process()
+template<bool TRACK_STATE, uint32_t HEAD_OFFSET, uint32_t H_TOTAL>
+__aicore__ inline void PreparedRecurrent<TRACK_STATE, HEAD_OFFSET, H_TOTAL>::Process()
 {
     AscendC::InitSocState();
 
     const uint32_t blockIdx = AscendC::GetBlockIdx();
     constexpr uint32_t NUM_V_TILES = config::NUM_V_TILES;
     constexpr uint32_t NUM_REQ = config::NUM_REQ;
-    constexpr uint32_t H = config::H;
     constexpr uint32_t STAGING_STRIDE = config::STAGING_STRIDE;
     constexpr uint32_t STATE_STRIDE = config::STATE_STRIDE;
     constexpr uint32_t D = config::D;
@@ -322,7 +321,7 @@ __aicore__ inline void PreparedRecurrent<TRACK_STATE>::Process()
     // iv, req, head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     const uint32_t iv   = blockIdx % NUM_V_TILES;
     const uint32_t req  = (blockIdx / NUM_V_TILES) % NUM_REQ;
-    const uint32_t head = blockIdx / (NUM_V_TILES * NUM_REQ);
+    const uint32_t head = HEAD_OFFSET + blockIdx / (NUM_V_TILES * NUM_REQ);
     
     // bos = tl.load(STARTS + req).to(tl.int64)
     // eos = tl.load(STARTS + req + 1).to(tl.int64)
@@ -333,7 +332,7 @@ __aicore__ inline void PreparedRecurrent<TRACK_STATE>::Process()
 
     // pstate points at: state[slot, head, iv*BV, 0]
     const uint64_t pstate =
-        (static_cast<uint64_t>(slot) * H + head) * D * D 
+        (static_cast<uint64_t>(slot) * H_TOTAL + head) * D * D
         + static_cast<uint64_t>(iv*BV);
 
     if (slot > 0) {
@@ -355,7 +354,7 @@ __aicore__ inline void PreparedRecurrent<TRACK_STATE>::Process()
         if (trackSlot > 0) {
             // 与当前 pstate 相同的 GM 布局：[slot, head, K, V]
             ptrack =
-                (static_cast<uint64_t>(trackSlot) * H + head) * D * D
+                (static_cast<uint64_t>(trackSlot) * H_TOTAL + head) * D * D
                 + static_cast<uint64_t>(iv) * BV;
 
             if (trackLen == 0) {
@@ -386,7 +385,7 @@ __aicore__ inline void PreparedRecurrent<TRACK_STATE>::Process()
 
     // Prefetch first token into buf[0].
     if (bos < eos) {
-        const uint64_t row0 = static_cast<uint64_t>(bos) * H + head;
+        const uint64_t row0 = static_cast<uint64_t>(bos) * H_TOTAL + head;
         AscendC::DataCopy(qLocal[0], qnGm[row0 * D], D);
         AscendC::DataCopy(kLocal[0], knGm[row0 * D], D);
         AscendC::DataCopy(decayLocal[0], decayGm[row0 * D], D);
@@ -417,7 +416,7 @@ __aicore__ inline void PreparedRecurrent<TRACK_STATE>::Process()
         // k = tl.load(KN + row * D + ks)
         // v = tl.load(V + row * D + vs).to(tl.float32)
         // decay = tl.load(GDECAY + row * D + ks)
-        const uint64_t row = static_cast<uint64_t>(token) * H + head;
+        const uint64_t row = static_cast<uint64_t>(token) * H_TOTAL + head;
         const uint32_t cur = (token - bos) & 1;
         const uint32_t nxt = 1 - cur;
         int32_t cur_buf_e = cur == 0 ? EVENT_MTE2_V_QKVD_0 : EVENT_MTE2_V_QKVD_1;
@@ -438,7 +437,7 @@ __aicore__ inline void PreparedRecurrent<TRACK_STATE>::Process()
         // Prefetch next token into buf[nxt].
         // MTE2 loads run concurrently with the Vector computation below.
         if (posn_1) {
-            const uint64_t nextRow = static_cast<uint64_t>(token + 1) * H + head;
+            const uint64_t nextRow = static_cast<uint64_t>(token + 1) * H_TOTAL + head;
             AscendC::DataCopy(qLocal[nxt], qnGm[nextRow * D], D);
             AscendC::DataCopy(kLocal[nxt], knGm[nextRow * D], D);
             AscendC::DataCopy(decayLocal[nxt], decayGm[nextRow * D], D);
@@ -576,57 +575,34 @@ __aicore__ inline void PreparedRecurrent<TRACK_STATE>::Process()
 }
 
 
-extern "C" __global__ __vector__
-void prepared_recurrent_kernel(
-    GM_ADDR QN, GM_ADDR KN,         // fp32
-    GM_ADDR V,                      // bf16
-    GM_ADDR GDECAY, GM_ADDR BETA,   // fp32
-    GM_ADDR OUT,                    // bf16
-    GM_ADDR STATE,                  // fp32
-    GM_ADDR INDICES,                // int32/int64
-    GM_ADDR STARTS,                 // int32
-    GM_ADDR TRACK_INDICES,          // int32/int64
-    GM_ADDR TRACK_LENS              // int32/int64
-) {
-    PreparedRecurrent<false> op;
-    op.Init(QN, KN,         // fp32
-            V,                      // bf16
-            GDECAY, BETA,   // fp32
-            OUT,                    // bf16
-            STATE,                  // fp32
-            INDICES,                // int32/int64
-            STARTS,                 // int32
-            TRACK_INDICES,
-            TRACK_LENS
-    );
-    op.Process();
+#define DEFINE_KERNEL(NAME, TRACK, HOFF, HTOT)                          \
+extern "C" __global__ __vector__                                        \
+void NAME(                                                              \
+    GM_ADDR QN, GM_ADDR KN, GM_ADDR V,                                 \
+    GM_ADDR GDECAY, GM_ADDR BETA, GM_ADDR OUT,                         \
+    GM_ADDR STATE, GM_ADDR INDICES, GM_ADDR STARTS,                    \
+    GM_ADDR TRACK_INDICES, GM_ADDR TRACK_LENS                          \
+) {                                                                     \
+    PreparedRecurrent<TRACK, HOFF, HTOT> op;                            \
+    op.Init(QN, KN, V, GDECAY, BETA, OUT,                              \
+            STATE, INDICES, STARTS,                                     \
+            TRACK_INDICES, TRACK_LENS);                                 \
+    op.Process();                                                       \
 }
 
-extern "C" __global__ __vector__
-void prepared_recurrent_kernel_track(
-    GM_ADDR QN, GM_ADDR KN,         // fp32
-    GM_ADDR V,                      // bf16
-    GM_ADDR GDECAY, GM_ADDR BETA,   // fp32
-    GM_ADDR OUT,                    // bf16
-    GM_ADDR STATE,                  // fp32
-    GM_ADDR INDICES,                // int32/int64
-    GM_ADDR STARTS,                 // int32
-    GM_ADDR TRACK_INDICES,          // int32/int64
-    GM_ADDR TRACK_LENS              // int32/int64
-) {
-    PreparedRecurrent<true> op;
-    op.Init(QN, KN,         // fp32
-            V,                      // bf16
-            GDECAY, BETA,   // fp32
-            OUT,                    // bf16
-            STATE,                  // fp32
-            INDICES,                // int32/int64
-            STARTS,                 // int32
-            TRACK_INDICES,
-            TRACK_LENS
-    );
-    op.Process();
-}
+// H_TOTAL=4, HEAD_OFFSET=0
+DEFINE_KERNEL(prepared_recurrent_kernel_h4_o0,       false, 0, 4)
+DEFINE_KERNEL(prepared_recurrent_kernel_track_h4_o0, true,  0, 4)
+
+// H_TOTAL=8, HEAD_OFFSET=0
+DEFINE_KERNEL(prepared_recurrent_kernel_h8_o0,       false, 0, 8)
+DEFINE_KERNEL(prepared_recurrent_kernel_track_h8_o0, true,  0, 8)
+
+// H_TOTAL=8, HEAD_OFFSET=4
+DEFINE_KERNEL(prepared_recurrent_kernel_h8_o4,       false, 4, 8)
+DEFINE_KERNEL(prepared_recurrent_kernel_track_h8_o4, true,  4, 8)
+
+#undef DEFINE_KERNEL
 
 // ── Host-side: torch custom op registration ────────────────────────────
 
@@ -644,18 +620,26 @@ void prepared_recurrent(
     const at::Tensor &starts,
     const c10::optional<at::Tensor> &track_indices,
     const c10::optional<at::Tensor> &track_lens,
-    bool track_state)
+    bool track_state,
+    int64_t head_offset)
 {
     TORCH_CHECK(qn.is_privateuseone(), "qn must be an NPU tensor");
     TORCH_CHECK(kn.is_privateuseone(), "kn must be an NPU tensor");
     TORCH_CHECK(v.is_privateuseone(),  "v must be an NPU tensor");
 
-    constexpr int32_t H = 4;
+    constexpr int32_t HEADS_PER_LAUNCH = 4;
     constexpr int32_t D = 128;
     constexpr int32_t BV = 16;
-    constexpr int32_t NUM_REQ = 1;  // 与当前 device config 一致
+    constexpr int32_t NUM_REQ = 1;
     constexpr int32_t NUM_V_TILES = (D + BV - 1) / BV;
-    constexpr int32_t blockDim = NUM_V_TILES * NUM_REQ * H;
+    constexpr int32_t blockDim = NUM_V_TILES * NUM_REQ * HEADS_PER_LAUNCH;
+
+    // state shape: [slots, H_TOTAL, D, D]
+    const int32_t H_TOTAL = static_cast<int32_t>(state.size(1));
+    TORCH_CHECK(H_TOTAL == 4 || H_TOTAL == 8,
+                "state dim 1 (num_heads) must be 4 or 8, got ", H_TOTAL);
+    TORCH_CHECK(head_offset == 0 || (H_TOTAL == 8 && head_offset == 4),
+                "head_offset must be 0 (H=4/8) or 4 (H=8), got ", head_offset);
 
     auto gm = [](const at::Tensor &tensor) -> uint8_t* {
         return reinterpret_cast<uint8_t*>(
@@ -697,22 +681,36 @@ void prepared_recurrent(
     }
 
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
-    // printf("start\n");
-    if (track_state) {
-        prepared_recurrent_kernel_track<<<blockDim, nullptr, stream>>>(
-            gm(qn), gm(kn), gm(v),
-            gm(gdecay), gm(beta),
-            gm(out), gm(state),
-            gm(indices), gm(starts),
-            trackIndicesPtr, trackLensPtr);
+
+#define LAUNCH(KERNEL)                              \
+    KERNEL<<<blockDim, nullptr, stream>>>(           \
+        gm(qn), gm(kn), gm(v),                     \
+        gm(gdecay), gm(beta),                       \
+        gm(out), gm(state),                          \
+        gm(indices), gm(starts),                     \
+        trackIndicesPtr, trackLensPtr)
+
+    if (H_TOTAL == 4) {
+        if (track_state) {
+            LAUNCH(prepared_recurrent_kernel_track_h4_o0);
+        } else {
+            LAUNCH(prepared_recurrent_kernel_h4_o0);
+        }
+    } else if (head_offset == 0) {
+        if (track_state) {
+            LAUNCH(prepared_recurrent_kernel_track_h8_o0);
+        } else {
+            LAUNCH(prepared_recurrent_kernel_h8_o0);
+        }
     } else {
-        prepared_recurrent_kernel<<<blockDim, nullptr, stream>>>(
-            gm(qn), gm(kn), gm(v),
-            gm(gdecay), gm(beta),
-            gm(out), gm(state),
-            gm(indices), gm(starts),
-            nullptr, nullptr);
+        if (track_state) {
+            LAUNCH(prepared_recurrent_kernel_track_h8_o4);
+        } else {
+            LAUNCH(prepared_recurrent_kernel_h8_o4);
+        }
     }
+
+#undef LAUNCH
 }
 
 TORCH_LIBRARY_FRAGMENT(sgl_glm53_ascend, m) {
@@ -720,7 +718,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_glm53_ascend, m) {
           "Tensor gdecay, Tensor beta, Tensor(a!) out, Tensor(b!) state, "
           "Tensor indices, Tensor starts, "
           "Tensor? track_indices=None, Tensor? track_lens=None, "
-          "bool track_state=False) -> ()");
+          "bool track_state=False, int head_offset=0) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(sgl_glm53_ascend, PrivateUse1, m) {

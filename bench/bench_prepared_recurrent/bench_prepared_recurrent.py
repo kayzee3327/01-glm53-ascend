@@ -90,6 +90,7 @@ class _prepared_recurrent_opt:
         QN, KN, V, GDECAY, BETA, OUT, STATE,
         INDICES, STARTS, TRACK_INDICES, TRACK_LENS,
         TRACK_STATE, H, D, BV, S0, S1, SK, SV,
+        HEAD_OFFSET=0,
         **kwargs,
     ):
         _prepared_recurrent_torch(
@@ -98,6 +99,7 @@ class _prepared_recurrent_opt:
             track_indices=TRACK_INDICES if TRACK_STATE else None,
             track_lens=TRACK_LENS if TRACK_STATE else None,
             track_state=TRACK_STATE,
+            head_offset=HEAD_OFFSET,
         )
 
 

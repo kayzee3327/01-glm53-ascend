@@ -16,8 +16,9 @@ def prepared_recurrent(
     track_indices: Optional[torch.Tensor] = None,
     track_lens: Optional[torch.Tensor] = None,
     track_state: bool = False,
+    head_offset: int = 0,
 ):
     return torch.ops.sgl_glm53_ascend.prepared_recurrent(
         qn, kn, v, gdecay, beta, out, state, indices, starts,
-        track_indices, track_lens, track_state,
+        track_indices, track_lens, track_state, head_offset,
     )

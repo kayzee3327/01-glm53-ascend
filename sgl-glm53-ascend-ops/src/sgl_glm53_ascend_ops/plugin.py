@@ -17,12 +17,13 @@ def _prepared_recurrent(
     track_indices: Optional[torch.Tensor] = None,
     track_lens: Optional[torch.Tensor] = None,
     track_state: bool = False,
+    head_offset: int = 0,
 ):
     from .ops.kda import prepared_recurrent
 
     return prepared_recurrent(
         qn, kn, v, gdecay, beta, out, state, indices, starts,
-        track_indices, track_lens, track_state,
+        track_indices, track_lens, track_state, head_offset,
     )
 
 
