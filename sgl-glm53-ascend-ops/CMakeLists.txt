@@ -91,11 +91,12 @@ target_link_libraries(torch_deps INTERFACE torch_npu torch c10)
 # ---------------------------------------------------------------------------
 # Kernel registration helper
 # ---------------------------------------------------------------------------
-# add_ascend_kernel(<name> <source>)
-#   Creates an OBJECT library target called <name>_kernel.
-function(add_ascend_kernel NAME SOURCE)
+# add_ascend_kernel(<name> <source>...)
+#   Creates an OBJECT library target called <name>_kernel. Accepts more than one
+#   source, for an operator split across translation units.
+function(add_ascend_kernel NAME)
     set(_TARGET "${NAME}_kernel")
-    add_library(${_TARGET} OBJECT "${SOURCE}")
+    add_library(${_TARGET} OBJECT ${ARGN})
     target_link_libraries(${_TARGET} PRIVATE torch_deps)
 
     set_property(GLOBAL APPEND PROPERTY _SGL_KERNEL_TARGETS "${_TARGET}")
@@ -111,18 +112,30 @@ set(SGL_OPS "" CACHE STRING
 # ---------------------------------------------------------------------------
 # Kernel definitions — one per independently developed operator
 # ---------------------------------------------------------------------------
-set(_ALL_KERNEL_NAMES helloworld prepared_recurrent reduce)
+set(_ALL_KERNEL_NAMES helloworld prepared_recurrent kda_varlen_recurrent reduce)
 
-set(_SRC_helloworld          csrc/helloworld/helloworld.cpp)
-set(_SRC_prepared_recurrent  csrc/kda/prepared_recurrent.cpp)
-set(_SRC_reduce              csrc/reduce/reduce_sum.cpp)
+set(_SRC_helloworld            csrc/helloworld/helloworld.cpp)
+set(_SRC_prepared_recurrent    csrc/kda/prepared_recurrent.cpp)
+# kda_varlen_recurrent is one operator across several translation units: the
+# host op (validation, dispatch, registration) plus one file per kernel, since
+# prefill H4/H8 and decode H16/H32/H64 each want their own tiling and block
+# mapping. They build as a single OBJECT target because they are one op — a
+# partial set would link to an unresolved launcher.
+set(_SRC_kda_varlen_recurrent
+    csrc/kda/kda_varlen_recurrent.cpp
+    csrc/kda/kda_varlen_recurrent_prefill_h4.cpp
+    csrc/kda/kda_varlen_recurrent_prefill_h8.cpp
+    csrc/kda/kda_varlen_recurrent_decode_h16.cpp
+    csrc/kda/kda_varlen_recurrent_decode_h32.cpp
+    csrc/kda/kda_varlen_recurrent_decode_h64.cpp)
+set(_SRC_reduce                csrc/reduce/reduce_sum.cpp)
 
 foreach(_NAME IN LISTS _ALL_KERNEL_NAMES)
     if(SGL_OPS AND NOT "${_NAME}" IN_LIST SGL_OPS)
         message(STATUS "Kernel skipped: ${_NAME}")
         continue()
     endif()
-    add_ascend_kernel("${_NAME}" "${_SRC_${_NAME}}")
+    add_ascend_kernel("${_NAME}" ${_SRC_${_NAME}})
     message(STATUS "Kernel enabled: ${_NAME} -> ${_SRC_${_NAME}}")
 endforeach()
 
