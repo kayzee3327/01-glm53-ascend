@@ -174,6 +174,24 @@ struct KdaLaunchArgs {
     uint8_t *track_indices; // int32 [numReq], null unless tracking
     uint8_t *track_lens;    // int32 [numReq], null unless tracking
 
+    // Per-step state checkpoints for speculative verify; null when not
+    // requested, which is what a decode launcher switches on. fp32, same
+    // dtype and same K-contiguous orientation as the state pool, and indexed
+    // by the request's position in the batch rather than by its state slot:
+    //
+    //     mid[req * mid_stride_req + step * mid_stride_step
+    //                              + head * mid_stride_head + k]
+    //
+    // Strides are in elements and come from the caller's tensor, because the
+    // buffer it hands over is a transposed view of a 5-D pool and is not
+    // contiguous in the last two axes. When this is set the final state is
+    // *not* written back: the commit takes the accepted step out of here
+    // instead, and the source slot has to keep its pre-verify value.
+    uint8_t *mid;           // fp32 [slots,steps,H,K,V]
+    uint32_t mid_stride_req;
+    uint32_t mid_stride_step;
+    uint32_t mid_stride_head;
+
     // Scratch, below. Allocated by the host and owned by it for the duration of
     // the launch; a kernel that does not need a buffer ignores it rather than
     // asserting on it, so only the launchers documented as using one require it

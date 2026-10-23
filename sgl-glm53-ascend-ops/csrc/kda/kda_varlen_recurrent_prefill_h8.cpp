@@ -203,22 +203,43 @@ private:
         static constexpr uint32_t P_BT_ADDR = P_BRAW_ADDR + 64;
         // per-head constants, reloaded once per round: the dt_bias row.
         static constexpr uint32_t P_BIAS_ADDR = P_BT_ADDR + 64;
-        // scratch: one row of squares, and the folded half-sums of q and k,
-        // which take a full row between them.
-        static constexpr uint32_t P_TMP_ADDR = P_BIAS_ADDR + ROW_F32;
-        static constexpr uint32_t P_RED_ADDR = P_TMP_ADDR + ROW_F32;
+
+        // ── normalization scratch, sized for a whole chunk ──
+        //
+        // Rows carry no dependency on one another, so the normalization runs
+        // as one strided instruction per step across all `rows` rather than a
+        // per-row sequence. That costs the chunk-wide buffers below (16 KB of
+        // the 57 KB hole) and buys back 2*C Vector/Scalar round trips, which
+        // is what the per-row form actually spent its time on.
+        //
+        //   P_SQ   squares of one tensor's chunk; folded, then reused by k
+        //   P_RED  the folded 64-lane half-sums, q's rows then k's
+        //   P_NSQ  sum(x*x) per row, q then k, as the reduce leaves them
+        //   P_QS   the roots, Scalar's output and `Brcb`'s input
+        //   P_QBC  one datablock per row, all eight lanes that row's norm
+        static constexpr uint32_t P_SQ_ADDR = P_BIAS_ADDR + ROW_F32;
+        static constexpr uint32_t P_RED_ADDR = P_SQ_ADDR + C * ROW_F32;
+        // Two tensors x C rows x 64 lanes.
+        static constexpr uint32_t P_NSQ_ADDR =
+            P_RED_ADDR + 2 * C * (D_ / 2) * sizeof(float);
+        // `Brcb` consumes 8 elements per repeat, so its source is rounded up
+        // to a whole repeat; the tail lanes are never broadcast into a row
+        // that the strided `Div` below actually visits.
+        static constexpr uint32_t BRCB_SRC = (C + 7) / 8 * 8 * sizeof(float);
+        static constexpr uint32_t P_QS_ADDR =
+            P_NSQ_ADDR + 2 * C * sizeof(float);
+        static constexpr uint32_t P_KS_ADDR = P_QS_ADDR + BRCB_SRC;
+        static constexpr uint32_t P_QBC_ADDR = P_KS_ADDR + BRCB_SRC;
+        static constexpr uint32_t P_KBC_ADDR = P_QBC_ADDR + C * 32;
+
         // One repeat of lower_bound, the gate division's numerator. `Div`
         // takes both operands as tensors, so the scalar has to be broadcast;
         // a src0 repeat stride of 0 then reuses this one repeat for all rows.
-        static constexpr uint32_t P_LB_ADDR = P_RED_ADDR + ROW_F32;
+        static constexpr uint32_t P_LB_ADDR = P_KBC_ADDR + C * 32;
         // Scalar/Vector exchange slot. This architecture has no scalar `exp`,
         // so exp(A_log) is computed on the Vector unit and read back here.
         static constexpr uint32_t P_SCR_ADDR = P_LB_ADDR + 256;
-        // One row of the broadcast q/k norm. `Div` takes both operands as
-        // tensors, and the division is kept rather than folded into a
-        // reciprocal multiply so the result matches upstream bit for bit.
-        static constexpr uint32_t P_NORM_ADDR = P_SCR_ADDR + 256;
-        static constexpr uint32_t P_END = P_NORM_ADDR + ROW_F32;
+        static constexpr uint32_t P_END = P_SCR_ADDR + 256;
 
         // The producer region lives entirely in the hole below Q0.
         static_assert(P_END <= Q0_ADDR,
@@ -506,16 +527,24 @@ KdaVarlenRecurrentPrefillH8<TRACK_STATE, H_TOTAL>::RunProducer(
         AscendC::TPosition::VECCALC, UbLayout::P_BT_ADDR, C);
     AscendC::LocalTensor<float> biasLocal(
         AscendC::TPosition::VECCALC, UbLayout::P_BIAS_ADDR, D);
-    AscendC::LocalTensor<float> tmpLocal(
-        AscendC::TPosition::VECCALC, UbLayout::P_TMP_ADDR, D);
+    AscendC::LocalTensor<float> sqLocal(
+        AscendC::TPosition::VECCALC, UbLayout::P_SQ_ADDR, C * D);
     AscendC::LocalTensor<float> redLocal(
-        AscendC::TPosition::VECCALC, UbLayout::P_RED_ADDR, D);
+        AscendC::TPosition::VECCALC, UbLayout::P_RED_ADDR, 2 * C * (D / 2));
+    AscendC::LocalTensor<float> nsqLocal(
+        AscendC::TPosition::VECCALC, UbLayout::P_NSQ_ADDR, 2 * C);
+    AscendC::LocalTensor<float> qsLocal(
+        AscendC::TPosition::VECCALC, UbLayout::P_QS_ADDR, C);
+    AscendC::LocalTensor<float> ksLocal(
+        AscendC::TPosition::VECCALC, UbLayout::P_KS_ADDR, C);
+    AscendC::LocalTensor<float> qbcLocal(
+        AscendC::TPosition::VECCALC, UbLayout::P_QBC_ADDR, C * 8);
+    AscendC::LocalTensor<float> kbcLocal(
+        AscendC::TPosition::VECCALC, UbLayout::P_KBC_ADDR, C * 8);
     AscendC::LocalTensor<float> lbLocal(
         AscendC::TPosition::VECCALC, UbLayout::P_LB_ADDR, 64);
     AscendC::LocalTensor<float> scrLocal(
         AscendC::TPosition::VECCALC, UbLayout::P_SCR_ADDR, 64);
-    AscendC::LocalTensor<float> normLocal(
-        AscendC::TPosition::VECCALC, UbLayout::P_NORM_ADDR, D);
 
     // The gate's division numerator, broadcast once — round-independent, so it
     // stays outside the round loop. `Div` takes both operands as tensors on
@@ -670,71 +699,123 @@ KdaVarlenRecurrentPrefillH8<TRACK_STATE, H_TOTAL>::RunProducer(
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Exp(gdLocal, gdLocal, rows * D);
 
-            // ── q, k: L2 normalize row by row; q also takes `scale` ──
+            // ── q, k: L2 normalize the whole chunk; q also takes `scale` ──
             //
-            // The norm is a per-row scalar, so each row costs a Vector→Scalar
-            // round trip. `sqrt` exists on the Scalar unit, so the root is
-            // taken there and does not need a second trip back through Vector.
+            // The norm is a per-row scalar, but the rows are independent, so
+            // this runs as one strided instruction per step over all `rows`
+            // instead of a per-row sequence. What that saves is not vector
+            // issue slots — it is the Vector/Scalar handshake. The root has to
+            // be taken on Scalar (see below), and a per-row form pays a V_S
+            // and an S_V for every row, 2*C full pipeline drains per chunk,
+            // each one also serializing the row's own six vector instructions
+            // behind it. Batched, the chunk costs exactly one round trip
+            // whatever C is.
+            //
+            // Every step below is elementwise or a 64-lane reduce over the
+            // same 64 lanes as before, so no value's arithmetic changes — only
+            // how many instructions carry it. That matters because this kernel
+            // is bit-exact against Triton and the summation order is
+            // load-bearing.
+            //
+            // Strides are in datablocks (32 B = 8 floats): a 128-lane fp32 row
+            // is 16, a 64-lane half-row is 8.
+            constexpr uint8_t ROW_BLK = D * sizeof(float) / 32;        // 16
+            constexpr uint8_t HALF_BLK = (D / 2) * sizeof(float) / 32; // 8
+            const uint8_t reps = static_cast<uint8_t>(rows);
+
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(qnLocal, qbLocal, AscendC::RoundMode::CAST_NONE,
+                          rows * D);
+            AscendC::Cast(knLocal, kbLocal, AscendC::RoundMode::CAST_NONE,
+                          rows * D);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            // sum(x*x) over 128 lanes, in upstream's summation order.
+            //
+            // `tl.sum` over 128 fp32 lanes is bit-identical to `torch.sum(-1)`
+            // and to neither a 2x64 nor a 4x32 decomposition. Of thirteen
+            // candidate trees measured against it, exactly one matched on
+            // every row: add the two 64-lane halves elementwise, then reduce
+            // the 64 partials as a binary tree over adjacent lanes. A 2x64
+            // `WholeReduceSum` pair differs on ~28% of rows. The norm divides
+            // q and k on every step of a recurrence, so a last-bit difference
+            // here compounds along the sequence; the order has to match.
+            //
+            // The fold is the same elementwise add as before, issued once with
+            // a repeat per row: 64 lanes of dst per repeat (stride 8
+            // datablocks) drawn from a 128-lane row (stride 16), with the
+            // upper half reached by starting src1 one half-row in.
+            const AscendC::BinaryRepeatParams foldParams{
+                1, 1, 1, HALF_BLK, ROW_BLK, ROW_BLK};
+            AscendC::Mul(sqLocal, qnLocal, qnLocal, rows * D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Add(redLocal, sqLocal, sqLocal[D / 2], D / 2, reps,
+                         foldParams);
+            AscendC::PipeBarrier<PIPE_V>();
+            // k reuses the squares buffer, so the fold above must have read it.
+            AscendC::Mul(sqLocal, knLocal, knLocal, rows * D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Add(redLocal[C * (D / 2)], sqLocal, sqLocal[D / 2], D / 2,
+                         reps, foldParams);
+            AscendC::PipeBarrier<PIPE_V>();
+            // One repeat per row, each reducing that row's 64 folded partials.
+            // `mask` fixes the reduction tree, so a repeat here is the same
+            // tree the two-repeat per-row form used; only the count changes.
+            // q's norms land packed at `nsqLocal[0]`, k's at `nsqLocal[C]`.
+            AscendC::WholeReduceSum<float>(nsqLocal, redLocal, 64, reps, 1, 1,
+                                           HALF_BLK);
+            AscendC::WholeReduceSum<float>(nsqLocal[C], redLocal[C * (D / 2)],
+                                           64, reps, 1, 1, HALF_BLK);
+
+            // Vector result read by Scalar: a real event, not a PipeBarrier.
+            // One round trip for the chunk, which is the point of the batching.
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_V_S_PROD);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_V_S_PROD);
+            // sum(x*x) + 1e-6, then sqrt, matching upstream's epsilon
+            // placement. The root stays on the Scalar unit: the Vector `Sqrt`
+            // is documented at 1 ulp and measurably further from `tl.sqrt`
+            // here, roughly doubling the surviving output mismatches.
             for (uint32_t r = 0; r < rows; ++r) {
-                auto qRow = qnLocal[r * D];
-                auto kRow = knLocal[r * D];
-
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Cast(qRow, qbLocal[r * D], AscendC::RoundMode::CAST_NONE, D);
-                AscendC::Cast(kRow, kbLocal[r * D], AscendC::RoundMode::CAST_NONE, D);
-                AscendC::PipeBarrier<PIPE_V>();
-                // sum(x*x) over 128 lanes, in upstream's summation order.
-                //
-                // `tl.sum` over 128 fp32 lanes is bit-identical to
-                // `torch.sum(-1)` and to neither a 2x64 nor a 4x32
-                // decomposition. Of thirteen candidate trees measured against
-                // it, exactly one matched on every row: add the two 64-lane
-                // halves elementwise, then reduce the 64 partials as a binary
-                // tree over adjacent lanes. A 2x64 `WholeReduceSum` pair
-                // differs on ~28% of rows. The norm divides q and k on every
-                // step of a recurrence, so a last-bit difference here compounds
-                // along the sequence; the order has to match.
-                //
-                // q folds into the low half of `redLocal` and k into the high
-                // half, so one two-repeat `WholeReduceSum` finishes both and
-                // the norms land in lanes 0 and 1. Source and destination must
-                // not overlap, hence the write back into `tmpLocal`.
-                AscendC::Mul(tmpLocal, qRow, qRow, D);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Add(redLocal, tmpLocal, tmpLocal[D / 2], D / 2);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Mul(tmpLocal, kRow, kRow, D);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Add(redLocal[D / 2], tmpLocal, tmpLocal[D / 2], D / 2);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::WholeReduceSum<float>(tmpLocal, redLocal, 64, 2, 1, 1, 8);
-
-                // Vector result read by Scalar: a real event, not a PipeBarrier.
-                AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_V_S_PROD);
-                AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_V_S_PROD);
-                // sum(x*x) + 1e-6, then sqrt, matching upstream's epsilon
-                // placement. The root stays on the Scalar unit: the Vector
-                // `Sqrt` is documented at 1 ulp and measurably further from
-                // `tl.sqrt` here, roughly doubling the surviving output
-                // mismatches.
-                const float qNorm = sqrt(tmpLocal.GetValue(0) + 1e-6f);
-                const float kNorm = sqrt(tmpLocal.GetValue(1) + 1e-6f);
-                AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_S_V_PROD);
-                AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_S_V_PROD);
-                // Upstream is `q = q / norm` then `q *= scale`, and
-                // `k = k / norm`. Keep that order and keep both as real
-                // divisions: folding them into `scale / qNorm`, or into a
-                // reciprocal multiply, reassociates and costs a bf16 ulp on a
-                // few output elements.
-                AscendC::Duplicate(normLocal, qNorm, D);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Div(qRow, qRow, normLocal, D);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Muls(qRow, qRow, scale_, D);
-                AscendC::Duplicate(normLocal, kNorm, D);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Div(kRow, kRow, normLocal, D);
+                qsLocal.SetValue(r, sqrt(nsqLocal.GetValue(r) + 1e-6f));
+                ksLocal.SetValue(r, sqrt(nsqLocal.GetValue(C + r) + 1e-6f));
             }
+            // `Brcb` reads a whole 8-element repeat, so a short final chunk
+            // would otherwise broadcast uninitialized UB. Those datablocks are
+            // never divided by — the `Div`s below repeat only `rows` times —
+            // but a finite filler keeps the buffer free of stray NaN.
+            const uint8_t brcbReps = static_cast<uint8_t>((rows + 7) / 8);
+            for (uint32_t r = rows; r < brcbReps * 8u; ++r) {
+                qsLocal.SetValue(r, 1.0f);
+                ksLocal.SetValue(r, 1.0f);
+            }
+            AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_S_V_PROD);
+            AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_S_V_PROD);
+
+            // Upstream is `q = q / norm` then `q *= scale`, and `k = k / norm`.
+            // Keep that order and keep both as real divisions: folding them
+            // into `scale / qNorm`, or into a reciprocal multiply,
+            // reassociates and costs a bf16 ulp on a few output elements.
+            //
+            // `Div` takes both operands as tensors, so each row's norm has to
+            // occupy lanes. `Brcb` fills one datablock per row with it, and a
+            // src1 block stride of 0 then makes a repeat reuse that single
+            // datablock across all 64 of its lanes — so the divisor tensor is
+            // C datablocks rather than C full rows, and no per-row `Duplicate`
+            // is needed. src1 advances one datablock per repeat, dst and src0
+            // a row.
+            AscendC::Brcb(qbcLocal, qsLocal, brcbReps, {1, 8});
+            AscendC::Brcb(kbcLocal, ksLocal, brcbReps, {1, 8});
+            AscendC::PipeBarrier<PIPE_V>();
+            const AscendC::BinaryRepeatParams normParams{
+                1, 1, 0, ROW_BLK, ROW_BLK, 1};
+            AscendC::Div(qnLocal, qnLocal, qbcLocal, 64, reps, normParams);
+            AscendC::Div(qnLocal[D / 2], qnLocal[D / 2], qbcLocal, 64, reps,
+                         normParams);
+            AscendC::Div(knLocal, knLocal, kbcLocal, 64, reps, normParams);
+            AscendC::Div(knLocal[D / 2], knLocal[D / 2], kbcLocal, 64, reps,
+                         normParams);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(qnLocal, qnLocal, scale_, rows * D);
 
             // Publish the chunk. The four stores must land before any consumer
             // is told the chunk exists, hence V_MTE3 before and MTE3_S after.

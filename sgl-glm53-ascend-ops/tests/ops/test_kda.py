@@ -116,21 +116,22 @@ def _varlen_case(heads, lengths, prefill):
 
 
 # (heads, lengths, prefill) -> reaches a launcher. Prefill takes one packed
-# sequence at the TP16/TP8 widths; decode takes one token per request at
-# TP4/TP2/TP1. Together these are the whole supported space.
+# sequence at the TP16/TP8 widths; decode takes one or more tokens per request
+# at TP4/TP2/TP1. Together these are the whole supported space, and every
+# width now has a live kernel — there is no stub left to assert against.
 #
-# H=4 prefill computes; the rest still stop at their kernel TODO. Numerical
-# correctness for H=4 lives in bench/kda_recurrent, which diffs elementwise
-# against the Triton baseline.
+# These are dispatch tests: they check a shape reaches its launcher and comes
+# back finite. Numerical correctness lives in bench/kda_recurrent, which diffs
+# elementwise against the Triton baseline, and in the two ported sglang suites
+# under tests/integration.
 IMPLEMENTED = [
     (4, (128,), True),
     (8, (128,), True),
-]
-
-STUBBED = [
     (16, (1,) * 3, False),
     (32, (1,) * 3, False),
     (64, (1,) * 3, False),
+    # Verify: more than one token per request, which decode also covers.
+    (16, (4,) * 3, False),
 ]
 
 
@@ -145,18 +146,6 @@ def test_varlen_recurrent_dispatch_runs(heads, lengths, prefill):
     assert torch.isfinite(out.float()).all()
 
 
-@pytest.mark.parametrize("heads,lengths,prefill", STUBBED)
-def test_varlen_recurrent_dispatch_reaches_a_kernel(heads, lengths, prefill):
-    """A supported shape selects a launcher and stops at the kernel TODO.
-
-    While a kernel is still a stub, "not implemented yet" IS the success
-    signal: it is raised only after dispatch has picked a launcher, so any
-    other message means the shape was rejected before selection.
-    """
-    with pytest.raises(RuntimeError, match="not implemented yet"):
-        kda_varlen_recurrent(**_varlen_case(heads, lengths, prefill))
-
-
 @pytest.mark.parametrize(
     "heads,lengths,prefill,message",
     [
@@ -165,9 +154,11 @@ def test_varlen_recurrent_dispatch_reaches_a_kernel(heads, lengths, prefill):
         (2, (128,), True, "prefill supports"),
         (16, (128,), True, "prefill supports"),
         (8, (1,) * 3, False, "decode supports"),
-        # Prefill is single-sequence; decode is one token per request.
+        # Prefill is single-sequence. Decode has no such rule: it loops over
+        # `cu_seqlens` and only needs a token per request, so the one case
+        # left is fewer tokens than requests.
         (8, (128, 128), True, "one packed sequence"),
-        (16, (4,) * 3, False, "one token per request"),
+        (16, (1, 1, 0), False, "one token per request"),
     ],
 )
 def test_varlen_recurrent_rejects_unsupported(heads, lengths, prefill, message):
@@ -180,13 +171,49 @@ def test_varlen_recurrent_rejects_unsupported(heads, lengths, prefill, message):
         kda_varlen_recurrent(**_varlen_case(heads, lengths, prefill))
 
 
-def test_varlen_recurrent_rejects_intermediate_state():
-    """Target verify has no per-token checkpoint path; refuse it explicitly."""
+def _intermediate(slots, steps, heads):
+    """The checkpoint buffer as the backend hands it over.
+
+    Allocated [slots,steps,HV,V,K] and transposed, so the kernel sees
+    [slots,steps,HV,K,V] with stride(3)==1 — the same K-contiguous orientation
+    as the state pool. A contiguous tensor of the final shape has these the
+    other way round and is refused by the layout check instead.
+    """
+    return torch.zeros(
+        slots, steps, heads, D, D, dtype=torch.float32, device=DEVICE
+    ).transpose(-1, -2)
+
+
+def test_varlen_recurrent_rejects_prefill_intermediate_state():
+    """Checkpointing is a decode concern; the prefill kernels have no store.
+
+    The buffer here is correctly laid out, so the rejection has to come from
+    the regime rule rather than from the layout check in front of it.
+    """
     case = _varlen_case(8, (128,), True)
-    case["intermediate_state"] = torch.zeros(
-        1, 128, 8, D, D, dtype=torch.float32, device=DEVICE
-    )
+    case["intermediate_state"] = _intermediate(1, 128, 8)
     with pytest.raises(RuntimeError, match="does not support intermediate_state"):
+        kda_varlen_recurrent(**case)
+
+
+def test_varlen_recurrent_accepts_decode_intermediate_state():
+    """Target verify: decode checkpoints the state after every step."""
+    case = _varlen_case(16, (4,) * 3, False)
+    case["intermediate_state"] = _intermediate(3, 4, 16)
+    out = kda_varlen_recurrent(**case)
+    torch.npu.synchronize()
+    assert out.shape == case["q"].shape
+    assert torch.isfinite(out.float()).all()
+    # The checkpoint buffer is the only output a checkpointing launch writes
+    # that the caller reads, so an unwritten one is the failure to catch.
+    assert case["intermediate_state"].float().abs().sum().item() > 0
+
+
+def test_varlen_recurrent_rejects_transposed_intermediate_state():
+    """V-contiguous checkpoints would be written in the wrong orientation."""
+    case = _varlen_case(16, (4,) * 3, False)
+    case["intermediate_state"] = _intermediate(3, 4, 16).transpose(-1, -2)
+    with pytest.raises(RuntimeError, match="K-contiguous"):
         kda_varlen_recurrent(**case)
 
 
@@ -207,6 +234,4 @@ if __name__ == "__main__":
     test_prepared_recurrent_track_state()
     for _heads, _lengths, _prefill in IMPLEMENTED:
         test_varlen_recurrent_dispatch_runs(_heads, _lengths, _prefill)
-    for _heads, _lengths, _prefill in STUBBED:
-        test_varlen_recurrent_dispatch_reaches_a_kernel(_heads, _lengths, _prefill)
     print("kda_varlen_recurrent dispatch: passed")

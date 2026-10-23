@@ -29,10 +29,9 @@
 // `kda_varlen_recurrent.h`, which also documents the split, the division of
 // labour with the caller, and the shared contract (state layout, reference
 // semantics). Registration stays here and only here: `TORCH_LIBRARY_FRAGMENT`
-// may define the schema once.
-//
-// The kernels themselves are still unimplemented: dispatch picks the right
-// launcher, then stops at an explicit check.
+// may define the schema once. The three decode widths share one device
+// template in `kda_varlen_recurrent_decode.h`; the two prefill widths do not
+// share anything.
 
 #include "kda_varlen_recurrent.h"
 
@@ -64,13 +63,13 @@ at::Tensor kda_varlen_recurrent(
     const at::Tensor &b,                     // bf16 [1,T,H]
     at::Tensor &initial_state_source,        // fp32 [slots,H,K,V], K-contiguous
     const at::Tensor &initial_state_indices, // int32/int64 [numReq]
-    const at::Tensor &cu_seqlens,            // int32 [numReq+1]
+    const at::Tensor &cu_seqlens,            // int32/int64 [numReq+1]
     double lower_bound,
     double scale,
     const c10::optional<at::Tensor> &intermediate_state, // fp32 5-D, unsupported
     bool prefill,
-    const c10::optional<at::Tensor> &track_state_indices, // int32 [numReq]
-    const c10::optional<at::Tensor> &track_state_lens)    // int32 [numReq]
+    const c10::optional<at::Tensor> &track_state_indices, // int32/int64 [numReq]
+    const c10::optional<at::Tensor> &track_state_lens)    // int32/int64 [numReq]
 {
     // Upstream's shape and metadata contract — the eleven `ValueError` checks,
     // the beta and gate shapes, the HV/H divisibility, the one-index-per-
@@ -86,10 +85,7 @@ at::Tensor kda_varlen_recurrent(
     const int64_t value_dim = v.size(3);
     const bool track_state = track_state_indices.has_value();
 
-    // Target verify (upstream's SAVE_INTERMEDIATE) has no per-token checkpoint
-    // path here, so refuse rather than silently leave the buffer unwritten.
-    TORCH_CHECK(!intermediate_state.has_value(),
-                "kda_varlen_recurrent does not support intermediate_state");
+    const bool save_intermediate = intermediate_state.has_value();
     TORCH_CHECK(q.device().is_privateuseone(), "q must be an NPU tensor");
     for (const auto &named : {std::pair<const char *, const at::Tensor &>{"q", q},
                               {"k", k},
@@ -129,6 +125,42 @@ at::Tensor kda_varlen_recurrent(
                 "state must be K-contiguous (stride(2)==1, stride(3)==",
                 config_D, "), got strides (", initial_state_source.stride(2),
                 ", ", initial_state_source.stride(3), ")");
+    // Upstream's own `intermediate_state` validation, repeated rather than
+    // inherited: it runs inside `glm_kda_varlen_recurrent_npu`, but it only
+    // checks the trailing shape and the dtype, and the kernel also indexes the
+    // leading two axes and assumes the same K-contiguous orientation as the
+    // state pool. The buffer that arrives here is a transposed view of a 5-D
+    // pool, so its last two axes are not contiguous and the strides have to
+    // come from the tensor.
+    if (save_intermediate) {
+        const auto &mid = *intermediate_state;
+        TORCH_CHECK(mid.dim() == 5 && mid.scalar_type() == at::kFloat,
+                    "intermediate_state must be a 5-D fp32 "
+                    "[slots,steps,HV,K,V] buffer");
+        TORCH_CHECK(mid.size(2) == num_value_heads && mid.size(3) == key_dim &&
+                        mid.size(4) == value_dim,
+                    "intermediate_state must be [slots,steps,HV,K,V] matching "
+                    "the head and feature dims");
+        TORCH_CHECK(mid.stride(3) == 1 && mid.stride(4) == config_D,
+                    "intermediate_state must be K-contiguous (stride(3)==1, "
+                    "stride(4)==", config_D, "), got strides (", mid.stride(3),
+                    ", ", mid.stride(4), ")");
+        TORCH_CHECK(mid.device() == q.device(),
+                    "intermediate_state must be on the same device as q");
+        TORCH_CHECK(mid.size(0) >= initial_state_indices.numel(),
+                    "intermediate_state needs a row per request, got ",
+                    mid.size(0), " for ", initial_state_indices.numel(),
+                    " requests");
+        // The per-request step count lives in `cu_seqlens` on the device, so
+        // the exact bound cannot be checked without a sync. This catches the
+        // case that actually goes wrong — a step axis too short for the
+        // tokens handed over — assuming they are spread evenly, which they are
+        // under verify.
+        TORCH_CHECK(mid.size(1) * initial_state_indices.numel() >= q.size(1),
+                    "intermediate_state has ", mid.size(1),
+                    " step rows, too few for ", q.size(1), " tokens across ",
+                    initial_state_indices.numel(), " requests");
+    }
     for (const auto &named :
          {std::pair<const char *, const at::Tensor &>{"initial_state_indices",
                                                       initial_state_indices},
@@ -141,6 +173,31 @@ at::Tensor kda_varlen_recurrent(
         TORCH_CHECK(named.second.device() == q.device(),
                     named.first, " must be on the same device as q");
     }
+
+    // Every kernel reads this metadata as `int32_t`, but int64 is accepted
+    // because upstream's callers pass it: `glm_kda_varlen_recurrent_npu`
+    // validates index tensors as int32-or-int64, and the Ascend backend's
+    // `mamba_track_indices` is int64 until it narrows them itself. Handing an
+    // int64 buffer straight to the kernel is not a wrong dtype but a wrong
+    // read: on little-endian the first element's low word aliases the correct
+    // value, so a one-request `initial_state_indices` happens to work while
+    // `cu_seqlens[1]` lands on a high word and reads as 0 — the kernel then
+    // computes nothing and returns the zero-filled output allocation, with no
+    // error anywhere. Narrow on the host instead, and keep the converted
+    // tensors alive in locals so their storage outlives the async launch.
+    auto as_int32 = [](const at::Tensor &t) {
+        return t.scalar_type() == at::kInt ? t : t.to(at::kInt);
+    };
+    auto as_int32_opt = [&as_int32](const c10::optional<at::Tensor> &t) {
+        return t.has_value() ? c10::optional<at::Tensor>(as_int32(*t))
+                             : c10::nullopt;
+    };
+    const at::Tensor indices_i32 = as_int32(initial_state_indices);
+    const at::Tensor starts_i32 = as_int32(cu_seqlens);
+    const c10::optional<at::Tensor> track_indices_i32 =
+        as_int32_opt(track_state_indices);
+    const c10::optional<at::Tensor> track_lens_i32 =
+        as_int32_opt(track_state_lens);
 
     const int64_t num_tokens = q.size(1);
     const int64_t num_req = initial_state_indices.numel();
@@ -199,11 +256,24 @@ at::Tensor kda_varlen_recurrent(
         /*A_log=*/gm(A_log),
         /*dt_bias=*/gm(dt_bias),
         /*state=*/gm(initial_state_source),
-        /*indices=*/gm(initial_state_indices),
-        /*starts=*/gm(cu_seqlens),
+        /*indices=*/gm(indices_i32),
+        /*starts=*/gm(starts_i32),
         /*out=*/gm(output),
-        /*track_indices=*/gm_opt(track_state_indices),
-        /*track_lens=*/gm_opt(track_state_lens),
+        /*track_indices=*/gm_opt(track_indices_i32),
+        /*track_lens=*/gm_opt(track_lens_i32),
+        /*mid=*/gm_opt(intermediate_state),
+        /*mid_stride_req=*/
+        save_intermediate
+            ? static_cast<uint32_t>(intermediate_state->stride(0))
+            : 0u,
+        /*mid_stride_step=*/
+        save_intermediate
+            ? static_cast<uint32_t>(intermediate_state->stride(1))
+            : 0u,
+        /*mid_stride_head=*/
+        save_intermediate
+            ? static_cast<uint32_t>(intermediate_state->stride(2))
+            : 0u,
         /*qn=*/needs_scratch ? gm(qn) : nullptr,
         /*kn=*/needs_scratch ? gm(kn) : nullptr,
         /*gdecay=*/needs_scratch ? gm(gdecay) : nullptr,
@@ -237,6 +307,11 @@ at::Tensor kda_varlen_recurrent(
         TORCH_CHECK(num_req == 1,
                     "kda_varlen_recurrent prefill expects one packed sequence, "
                     "got ", num_req);
+        // Checkpointing is a speculative-decode concern; the prefill kernels
+        // have no store for it and would leave the buffer unwritten.
+        TORCH_CHECK(!save_intermediate,
+                    "kda_varlen_recurrent prefill does not support "
+                    "intermediate_state");
         switch (num_value_heads) {
             case 4:  launch = &LaunchKdaPrefillH4; break;
             case 8:  launch = &LaunchKdaPrefillH8; break;
@@ -246,9 +321,14 @@ at::Tensor kda_varlen_recurrent(
                             "or H=8 (TP8), got H=", num_value_heads);
         }
     } else {
-        TORCH_CHECK(num_tokens == num_req,
-                    "kda_varlen_recurrent decode expects one token per request "
-                    "(T == numReq), got T=", num_tokens, " and numReq=", num_req);
+        // Both decode regimes come through here: plain decode at one token per
+        // request, and EAGLE target verify at `draft_token_num` tokens per
+        // request with a checkpoint after each. The kernel loops over
+        // `cu_seqlens`, so the only thing it needs is enough tokens to cover
+        // the requests — the split between them is the caller's.
+        TORCH_CHECK(num_tokens >= num_req,
+                    "kda_varlen_recurrent decode expects at least one token "
+                    "per request, got T=", num_tokens, " and numReq=", num_req);
         TORCH_CHECK(!track_state,
                     "kda_varlen_recurrent tracking is prefill-only");
         switch (num_value_heads) {
@@ -261,14 +341,6 @@ at::Tensor kda_varlen_recurrent(
                             "H=32 (TP2) or H=64 (TP1), got H=", num_value_heads);
         }
     }
-
-    // TODO(kernel): drop this once the three decode kernels compute. Their
-    // Init/Process are still empty, so launching one would enqueue a no-op and
-    // return a silently zero `output`. `needs_scratch` is exactly the two
-    // prefill paths, which are the implemented ones. Checking after selection
-    // means an unsupported H still reports as unsupported rather than as
-    // unimplemented.
-    TORCH_CHECK(needs_scratch, "kda_varlen_recurrent is not implemented yet");
 
     launch(args, stream);
     return output;
