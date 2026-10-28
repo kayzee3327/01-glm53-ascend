@@ -1,40 +1,19 @@
 """Correctness and speedup for the GLM-5.3 KDA varlen recurrence op.
 
-``glm_kda_varlen_recurrent_ascendc`` below is a copy of sglang's
-``glm_kda_varlen_recurrent_npu`` with only the compute dispatch replaced by
-``torch.ops.sgl_glm53_ascend.kda_varlen_recurrent``. Everything above that
-point is kept verbatim so the two arms differ in the kernel and nothing else.
+Target: ``glm_kda_varlen_recurrent_ascendc``
 
-Two references, because the caller has two prefill paths and the slower one is
-not what it runs:
+Three references:
+``triton``    
+``prepared``  ``SGLANG_GLM53_KDA_PREFILL_PREPARE=1`` +
+              ``SGLANG_GLM53_KDA_PREPARED_ASCENDC=1`` It covers prefill H4/H8 
+              with one packed sequence and no checkpoints; every other row 
+              reports ``-``.
+``fla``       ``fla_npu.ops.ascendc.recurrent_kda``. Checkpoints are out of 
+              scope, so ``verify`` rows report ``-``.
 
-``triton``    the generic Triton recurrence — one program per value tile per
-              head, BV=64. The caller's fallback, and all it has outside
-              prefill.
-``prepared``  ``SGLANG_GLM53_KDA_PREFILL_PREPARE=1`` plus
-              ``SGLANG_GLM53_KDA_PREPARED_ASCENDC=1``: the token-parallel FP32
-              input preparation followed by the Ascend C ``prepared_recurrent``
-              kernel. This is the deployed prefill path, roughly 3x the generic
-              one, so it is the comparison that decides whether the new kernel
-              is worth shipping. It covers prefill H4/H8 with one packed
-              sequence and no checkpoints; every other row reports ``-``.
-``fla``       ``fla_npu.ops.ascendc.recurrent_kda``, Tianjin University's fused
-              KDA recurrence from flash-linear-attention-npu. An outside
-              implementation of the same function, so it answers a question the
-              other two cannot: whether a gap is this op or this hardware. It
-              computes the gate, the L2 norm and the beta sigmoid in-kernel from
-              the model's own tensors, like ours and unlike ``prepared``. Well
-              behind on prefill and at parity on decode, which localizes its
-              deficit to block mapping rather than to the recurrence -- see
-              ``README.md``. Checkpoints are out of scope, so ``verify`` rows
-              report ``-``.
+Regimes are the deployed parallel strategies.
 
-Regimes are the deployed parallel strategies, ``H = 64 / attn_tp_size``:
-prefill at H=4/8 (TP16/TP8), decode at H=16/32/64 (TP4/TP2/TP1). A regime whose
-kernel is not written yet is skipped, so implementing one width at a time shows
-up as that row starting to report.
-
-Decode covers both of the caller's regimes, because they exercise different
+Decode covers all of the caller's regimes, because they exercise different
 code and only the second one is hot:
 
 ``decode``  one token per request, no checkpoints — ``forward_decode``.
@@ -44,9 +23,8 @@ code and only the second one is hot:
             shapes rather than a sweep, at one DP replica's batch; see
             ``VERIFY_SHAPES``.
 
-Both validate the state pool alongside the output, and ``verify`` validates the
-checkpoint buffer too: it is the only output of that path the caller actually
-reads, since a checkpointing launch deliberately leaves the state slot alone.
+All validate the state pool alongside the output, and ``verify`` validates the
+checkpoint buffer too.
 """
 
 from __future__ import annotations
@@ -138,8 +116,6 @@ DRAFT_TOKENS = 4
 #   512K DP4TP2        4   4   2     32     1      32     0.8
 #   512K DP2TP4        2   2   4     16     1      16     0.4
 #
-# 512K DP8TP1 has no row because that configuration is unavailable in
-# deployment, not because it was left unmeasured.
 VERIFY_SHAPES = (
     ("256K DP4TP2", 32, 2),
     ("256K DP2TP4", 16, 3),
@@ -286,16 +262,7 @@ def glm_kda_varlen_recurrent_prepared(
     rather than called, for one reason: upstream reaches the Ascend C kernel
     through ``prepared_recurrent_v2``, a sidecar op built by sglang's
     ``ascendc_prepared/build_compatible.py`` from this repo's
-    ``prepared_recurrent.cpp``. That op is not in this build. What the sidecar
-    adds over ``prepared_recurrent`` is a native transposed-state fast path and
-    int64 metadata, neither of which changes the recurrence, plus the H8
-    two-launch host loop — which is exactly the Python loop below. So calling
-    v1 twice per H8 measures the same kernels in the same order, and the
-    state-layout difference is absorbed by handing it the contiguous ``[K,V]``
-    orientation v1 wants.
-
-    Preparation is counted in, because the caller pays for it: it exists only to
-    feed this kernel, whereas the fused op reads the model's own tensors.
+    ``prepared_recurrent.cpp``. 
     """
     heads = q.shape[2]
     q, k, v, a, b = (t.contiguous() for t in (q, k, v, a, b))

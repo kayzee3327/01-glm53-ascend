@@ -1,37 +1,4 @@
 // GLM-5.3 KDA varlen recurrence — host op: validation, dispatch, registration.
-//
-// Substitutes for the implementation-selection block inside sglang's
-// `glm_kda_varlen_recurrent_npu` — both of its arms, not for the Python
-// function around it. Upstream that block picks between two implementations:
-// `run_prepared_prefill` (the prepared fast path, for single-sequence prefill
-// at H=4/8) and the `_glm_kda_varlen_recurrent_kernel[grid](...)` launch (the
-// generic Triton kernel, for everything else). Here that choice is the
-// prefill/decode launcher table, so the whole block collapses to one call.
-//
-// The argument list mirrors the Triton kernel's, since that is the wider of the
-// two signatures, minus everything the host can work out for itself: the state
-// and intermediate strides come from `.stride()`, the `SAVE_INTERMEDIATE` and
-// `TRACK_STATE` flags from whether a tensor was passed, the head and feature
-// widths from the shapes. The tiling constants (`BK`/`BV`/`BHV`, the grid,
-// `num_warps`) do not survive the move off Triton at all, and neither does the
-// prepared path's FP32 scratch: unlike `prepared_recurrent`, which takes
-// pre-normalized inputs, this op takes the raw bf16 q/k/v/a/b and folds the
-// gate, beta and q/k L2 normalization in, so the caller materializes nothing.
-//
-// The caller keeps what it already does before the selection: the upstream
-// shape/metadata `ValueError`s, `zeros_like(v)`, the `scale` default,
-// `.contiguous()`. None of it is repeated here. What this file checks is what
-// the kernels index against and cannot detect themselves, and what it decides
-// is which kernel runs.
-//
-// This file holds no device code. The five kernels live in their own
-// translation units, reached through the launchers declared in
-// `kda_varlen_recurrent.h`, which also documents the split, the division of
-// labour with the caller, and the shared contract (state layout, reference
-// semantics). Registration stays here and only here: `TORCH_LIBRARY_FRAGMENT`
-// may define the schema once. Decode H=16 and H=64 share one device template in
-// `kda_varlen_recurrent_decode.h`; H=32 is forked out of it and tuned on its
-// own, and the two prefill widths share nothing.
 
 #include "kda_varlen_recurrent.h"
 
@@ -41,18 +8,6 @@
 #include <torch/extension.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 
-// Argument names and order follow sglang's `glm_kda_varlen_recurrent_npu`, so
-// the mapping from the call site stays one-for-one and a reader does not need a
-// glossary to move between the two. Two deliberate departures, both because
-// the op replaces the selection block rather than the function:
-//   * `lower_bound` and `scale` are plain floats, not optionals: upstream has
-//     already rejected a null or non-negative bound and resolved `scale` to
-//     K**-0.5, both before the selection;
-//   * every argument is keyword-only, matching the `*` in the Python signature.
-//
-// The output is allocated here with `zeros_like(v)` and returned, as upstream
-// does, so the state pool stays the one in-place argument. Zeroed rather than
-// empty because a launcher covers only its own blocks.
 at::Tensor kda_varlen_recurrent(
     const at::Tensor &A_log,                 // fp32, H elements
     const at::Tensor &a,                     // bf16 [1,T,H,K]
@@ -71,14 +26,6 @@ at::Tensor kda_varlen_recurrent(
     const c10::optional<at::Tensor> &track_state_indices, // int32/int64 [numReq]
     const c10::optional<at::Tensor> &track_state_lens)    // int32/int64 [numReq]
 {
-    // Upstream's shape and metadata contract — the eleven `ValueError` checks,
-    // the beta and gate shapes, the HV/H divisibility, the one-index-per-
-    // sequence rule, the negative `lower_bound`, the prefix-checkpoint
-    // metadata — is validated by `glm_kda_varlen_recurrent_npu` before the
-    // selection block this op replaces, so none of it is repeated here. What
-    // follows is only what the kernels index against and cannot detect
-    // themselves: get one of these wrong and the result is out-of-bounds
-    // memory traffic, not a wrong answer.
     const int64_t num_q_heads = k.size(2);
     const int64_t key_dim = k.size(3);
     const int64_t num_value_heads = v.size(2);
@@ -174,17 +121,7 @@ at::Tensor kda_varlen_recurrent(
                     named.first, " must be on the same device as q");
     }
 
-    // Every kernel reads this metadata as `int32_t`, but int64 is accepted
-    // because upstream's callers pass it: `glm_kda_varlen_recurrent_npu`
-    // validates index tensors as int32-or-int64, and the Ascend backend's
-    // `mamba_track_indices` is int64 until it narrows them itself. Handing an
-    // int64 buffer straight to the kernel is not a wrong dtype but a wrong
-    // read: on little-endian the first element's low word aliases the correct
-    // value, so a one-request `initial_state_indices` happens to work while
-    // `cu_seqlens[1]` lands on a high word and reads as 0 — the kernel then
-    // computes nothing and returns the zero-filled output allocation, with no
-    // error anywhere. Narrow on the host instead, and keep the converted
-    // tensors alive in locals so their storage outlives the async launch.
+    // cu_seqlens passed as int64
     auto as_int32 = [](const at::Tensor &t) {
         return t.scalar_type() == at::kInt ? t : t.to(at::kInt);
     };
@@ -211,17 +148,7 @@ at::Tensor kda_varlen_recurrent(
         return t.has_value() ? gm(*t) : nullptr;
     };
 
-    // Scratch for the H=4 prefill kernel's producer blocks. Upstream these are
-    // the four tensors `_prepare_inputs` fills in a separate Triton launch;
-    // here the producers in the same grid fill them. Only that kernel reads
-    // them, so they are allocated only for it — the other four launchers get
-    // nulls and never dereference them.
-    //
-    // They are held in locals rather than passed straight into the args so
-    // their lifetime covers the launch: the launch is asynchronous on the
-    // stream, but these are caching-allocator tensors and are only returned to
-    // the pool once the stream has reached the free, so holding the handles
-    // here is enough.
+    // scratch: create empty tensors
     at::Tensor qn, kn, gdecay, beta, sync;
     const bool needs_scratch =
         prefill && (num_value_heads == 4 || num_value_heads == 8);
@@ -288,20 +215,6 @@ at::Tensor kda_varlen_recurrent(
 
     void *stream = c10_npu::getCurrentNPUStream().stream();
 
-    // This is the selection the op exists to absorb: upstream it was the
-    // `if prefill and ... and num_q_heads in (4, 8)` condition choosing between
-    // `run_prepared_prefill` and the generic Triton launch. Prefill is passed
-    // explicitly rather than inferred, because `T == numReq` cannot tell the
-    // regimes apart when both are 1.
-    //
-    // Selection is on H, which is set by the parallel strategy
-    // (H = num_heads / attn_tp_size). GLM-5.3-Flash has 64 heads total and the
-    // supported strategies are TP16/TP8 for prefill and TP4/TP2/TP1 for decode,
-    // so these five widths are the whole space — an H outside it is a
-    // misconfiguration, not a shape to accommodate. Raising names the widths
-    // that exist; the caller keeps its own fallback for the regimes the
-    // launcher set does not cover (ragged extend, multi-sequence prefill,
-    // target verify).
     void (*launch)(const KdaLaunchArgs &, void *) = nullptr;
     if (prefill) {
         TORCH_CHECK(num_req == 1,
@@ -321,11 +234,6 @@ at::Tensor kda_varlen_recurrent(
                             "or H=8 (TP8), got H=", num_value_heads);
         }
     } else {
-        // Both decode regimes come through here: plain decode at one token per
-        // request, and EAGLE target verify at `draft_token_num` tokens per
-        // request with a checkpoint after each. The kernel loops over
-        // `cu_seqlens`, so the only thing it needs is enough tokens to cover
-        // the requests — the split between them is the caller's.
         TORCH_CHECK(num_tokens >= num_req,
                     "kda_varlen_recurrent decode expects at least one token "
                     "per request, got T=", num_tokens, " and numReq=", num_req);
@@ -347,11 +255,6 @@ at::Tensor kda_varlen_recurrent(
 }
 
 TORCH_LIBRARY_FRAGMENT(sgl_glm53_ascend, m) {
-    // Keyword-only (leading `*`), following `glm_kda_varlen_recurrent_npu`.
-    // The returned output is freshly allocated, so it carries no alias
-    // annotation; the state pool is the one mutated argument. `scale` and
-    // `lower_bound` are non-optional because the caller resolves both before
-    // this point.
     m.def("kda_varlen_recurrent(*, Tensor A_log, Tensor a, Tensor dt_bias, "
           "Tensor q, Tensor k, Tensor v, Tensor b, "
           "Tensor(a!) initial_state_source, Tensor initial_state_indices, "

@@ -19,19 +19,7 @@ The target is whichever arm you are working on -- ``ascendc``, so speedups read
 as "ours vs theirs" once it exists. With no Ascend C op present the script falls
 back to measuring ``triton`` as the target so the other comparisons still run.
 
-There are no command-line options: every parameter is a module constant below,
-so a run is reproducible from the file alone and two runs are always comparable.
-To measure something else, edit the constants.
-
-Correctness is not decided between the three arms. Each is checked against
-``reference.py``, a direct transcription of the operator's documented formulas
-that is itself verified against a token-at-a-time recurrence in
-``test_reference.py``. An arm that disagrees with the reference is reported as
-FAIL rather than quietly becoming the baseline.
-
-Shapes come from the deployed parallel strategies, ``H = 64 / attn_tp_size``:
-prefill at H=4 (TP16) and H=8 (TP8), over the prefill token counts the
-recurrent bench also uses, so the two scripts' rows line up.
+Correctness is checked against ``reference.py``, torch fp64 ref.
 """
 
 from __future__ import annotations
@@ -42,11 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-# Operator development on this machine is restricted to physical card 4, and the
-# pin has to happen before torch_npu initializes -- `DEVICE` below is "npu:0",
-# which is an index into the *visible* set, so this makes it card 4. Set here
-# rather than left to the caller's shell because forgetting it silently
-# benchmarks on someone else's card.
+# Default npu:4
 os.environ.setdefault("ASCEND_RT_VISIBLE_DEVICES", "4")
 
 # --- vendor selection, before anything touches CANN ----------------------

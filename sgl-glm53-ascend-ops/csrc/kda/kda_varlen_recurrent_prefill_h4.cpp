@@ -1,84 +1,4 @@
 // GLM-5.3 KDA varlen recurrence — prefill kernel, H=4 (TP16).
-//
-// One packed sequence (numReq==1) and a long serial token loop. See
-// `kda_varlen_recurrent.h` for the shared contract and the reference semantics;
-// the host file validates everything before this launcher is reached.
-//
-// ── Why this kernel has two kinds of block ─────────────────────────────
-//
-// The recurrence is serial in the token index, so the only parallelism is
-// across (head, value tile) — 32 work items at H=4, BV=16. That leaves 8 of a
-// 910B's 40 vector cores with nothing to do, while the per-token inputs the
-// recurrence consumes (the gate, beta, and the q/k L2 normalization) are
-// entirely independent across tokens and are *not* serial at all.
-//
-// Upstream splits exactly along that line, but across two launches: a parallel
-// Triton `_prepare_inputs` writing four FP32 tensors, then the serial
-// `_prepared_recurrent` reading them. Measured on-device, the prepare half is
-// ~19% of the prepared path's time (H4/T4096: 1.16 ms of 6.61 ms) and it is
-// pure latency, because the recurrence cannot start until all of it lands.
-//
-// So this kernel runs both halves at once in one grid:
-//
-//     blocks  0..31   consumers — the serial recurrence, one state tile each
-//     blocks 32..39   producers — prepare per-token inputs, running ahead
-//
-// Consumers keep `prepared_recurrent.cpp`'s block decomposition unchanged,
-// which is what makes its UB map, transpose lists and token loop reusable:
-//
-//     iv   = blockIdx % NUM_V_TILES
-//     head = blockIdx / NUM_V_TILES
-//     state pointer = (slot * H_TOTAL + head) * D * D + iv * BV * D
-//
-// The state slot is K-contiguous (see `kda_varlen_recurrent.h`), so a tile of
-// BV value rows is a contiguous span and V is the axis that strides by D.
-//
-// Producers take two per head and split the token stream into chunks, even
-// chunks to one and odd to the other, so a head's inputs are always being
-// prepared from two cores while its 8 consumers read them.
-//
-// ── What this costs and why it is safe ────────────────────────────────
-//
-// Communication is through GM — the four FP32 intermediates, laid out exactly
-// as upstream lays them out (row = token * H + head), so the consumer's
-// indexing is the same expression it would use against the Triton output.
-// Notification is `IBSet`/`IBWait`, one bank per (producer, consumer lane, ring
-// slot). Measured cost: ~61 cycles per chunk in the consumer's `IBWait` and
-// ~122 in the producer's 8 `IBSet`s, against ~3000 cycles per token of real
-// consumer work. At 16 tokens per chunk that is noise.
-//
-// Three hazards worth naming, all of them load-bearing:
-//
-//   * `IBWait` *clears* the flag it consumes, so one `IBSet` can be awaited by
-//     exactly one `IBWait`. A producer therefore signals each of its 8
-//     consumers on its own bank; it does not broadcast once.
-//   * `IBSet` blocks while the flag is still set, which is what bounds producer
-//     run-ahead — but with a single bank per pair that bound is one chunk,
-//     which would serialize producer and consumer. Hence the small ring of
-//     `eventID`s: `kSyncRing` chunks of slack per pair.
-//   * `IBSet`/`IBWait` call `GetTPipePtr()->FetchEventID()` internally, so a
-//     `TPipe` must exist even though every buffer here is at a hand-laid
-//     absolute address. Without one it is a null dereference that surfaces as
-//     "MPU address access is invalid" on the waiting cores. The `TPipe` below
-//     never gets an `InitBuffer`, so it reserves no UB and the absolute map is
-//     unaffected.
-//
-// The grid must not exceed the physical core count or a wave of blocked
-// consumers can exclude the producers they wait on; `kda_prefill::kBlockDim`
-// static_asserts this.
-//
-// ── Divergence from `prepared_recurrent` ──────────────────────────────
-//
-// The consumer half is that kernel, with two changes: the chunk-boundary
-// `IBWait` is hoisted to just before the prefetch of the next token (so the
-// software pipeline stays full and the wait is not paid per token), and the
-// inputs come from this kernel's own producers rather than from Triton.
-//
-// The producer half is new, and it is the one place bit-exactness against
-// upstream is not guaranteed: Triton's `q / sqrt(sum(q*q) + 1e-6)` is a
-// division, and the Ascend sequence for it reassociates slightly. Everything
-// else — the `+1e-6` inside the sqrt, `scale` applied after normalization, the
-// L2 (not RMS) reading — is matched operation for operation.
 
 #include "kernel_operator.h"
 #include "kda_varlen_recurrent.h"
@@ -91,8 +11,6 @@
 // ── Device-side ────────────────────────────────────────────────────────
 
 // Hardware event IDs, managed by hand as in `prepared_recurrent`. Avoid 6/7.
-// Producer and consumer never run on the same core, so the two sets may reuse
-// ids freely; they are kept distinct anyway to keep traces readable.
 namespace {
 
 // Consumer, lifted from `prepared_recurrent.cpp`.
@@ -171,14 +89,7 @@ private:
                       "each head needs at least one producer");
     };
 
-    // UB map. The consumer half is `prepared_recurrent`'s map at the same
-    // addresses, deliberately: the token loop's repeat strides are derived from
-    // these offsets. The producer half and the sync scratch go in the 57 KB
-    // hole that map leaves between the state tile (8 KB at 0x0) and 0x10100.
-    //
-    // Producer and consumer never coexist on a core, so the two regions could
-    // overlap; they are kept disjoint so that a misrouted block corrupts
-    // nothing and traces stay legible.
+    // The consumer half is `prepared_recurrent`'s map at the same addresses
     struct UbLayout {
         // ── shared ──
         // 32 B of private scratch for the IBSet/IBWait handshake. Every core
@@ -426,20 +337,7 @@ __aicore__ inline void KdaVarlenRecurrentPrefillH4<TRACK_STATE, H_TOTAL>::Init(
         AscendC::TPosition::VECCALC, UbLayout::OUT_ADDR, BV);
 }
 
-// ── State tile movement ────────────────────────────────────────────────
-//
-// GM holds each state slot as [V, K] with K contiguous: the pool is allocated
-// [slots, H, V, K] and handed to the kernel as a transposed view, so stride(K)
-// is 1. The token loop wants [V, K] too, so the reduction over K runs along
-// contiguous lanes — the orientations agree and a tile is a contiguous span.
-//
-// `prepared_recurrent` moves this tile through a [128, 24] staging buffer and
-// a pair of `TransDataTo5HD` transposes, having read the layout as [K, V]. The
-// two transposes are exact inverses, so a load/store round trip is unaffected
-// and its outputs still match; what it leaves in GM is the state transposed.
-// Here both directions are a plain `DataCopy`, which is also one MTE
-// instruction instead of 24 and frees the 12 KB staging buffer.
-
+// no transpose by default
 template<bool TRACK_STATE, uint32_t H_TOTAL>
 __aicore__ inline void
 KdaVarlenRecurrentPrefillH4<TRACK_STATE, H_TOTAL>::LoadStateTile(
@@ -461,10 +359,6 @@ KdaVarlenRecurrentPrefillH4<TRACK_STATE, H_TOTAL>::StoreStateTile(
     const AscendC::LocalTensor<float>& state,
     uint64_t gmOffset)
 {
-    // The mirror of `LoadStateTile`: same orientation on both sides, so the
-    // tile leaves as BV contiguous rows. Each tile owns a disjoint, 64 B
-    // aligned span of GM (BV * D floats = 8 KB), so concurrent stores from the
-    // 8 consumers of a head cannot share a datablock.
     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(1);
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(1);
 

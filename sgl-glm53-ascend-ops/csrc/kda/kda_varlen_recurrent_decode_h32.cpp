@@ -1,94 +1,5 @@
 // GLM-5.3 KDA varlen recurrence — decode kernel, H=32 (TP2).
-//
-// Forked out of `kda_varlen_recurrent_decode.h`, which still serves H=16 and
-// H=64. H=32 is the priority decode shape — DP4TP2 at 256K puts 2 requests and
-// 32 heads on a device, 4 tokens per request under EAGLE verify, so it is the
-// one worth tuning past what a width-generic kernel can express — and tuning it
-// in the shared header would move the other two widths with it. This file owns
-// H=32 alone: both instantiations, the launcher, and from here on its own
-// tiling. See `kda_varlen_recurrent.h` for the shared contract and the
-// reference semantics.
-//
-// It starts as a verbatim copy of the shared template at the H=32
-// instantiation, so the two are currently bit-identical and the fork is a
-// no-op. Divergence belongs here; anything learned that is not H=32-specific is
-// worth porting back to the header rather than left to drift.
-//
-// The grid is 64 blocks against 40 vector cores — 1.6 waves, so the second wave
-// runs at 60% occupancy and the kernel is not latency-hidden. The traffic floor
-// for the shape is ~17 us (20 MB, four checkpoints per step dominating),
-// against the Triton baseline's 38.8 us under graph replay and 41.1 us for this
-// kernel as forked.
-//
-// ── What decode actually is ────────────────────────────────────────────
-//
-// Not "one token per request". The decode-side caller has two regimes and the
-// speculative one dominates the profile:
-//
-//   forward_decode        T == numReq,              no intermediate
-//   target verify         T == numReq * draftTok,   intermediate required
-//
-// Under EAGLE the verify path runs `draft_token_num` (4 in the deployed config)
-// sequential recurrence steps per request and checkpoints the state after every
-// one, because the post-verify commit has to be able to pick up at whichever
-// step the draft was accepted to. Both regimes come through as a packed token
-// stream split by `cu_seqlens`, so a single loop over `[bos, eos)` covers them;
-// the step count is a runtime value, never a template parameter.
-//
-// ── Why the tiling is the opposite of prefill's ────────────────────────
-//
-// Prefill splits a head across 8 cores at BV=16, because it has one packed
-// sequence and needs parallelism from somewhere. Decode has `numReq * H`
-// independent work items before any value split, so it does not, and the split
-// is pure overhead there:
-//
-//   * q, k, the gate row and beta are per (token, head) — shared by every
-//     value tile of a head. Splitting a head 8 ways computes the gate, the two
-//     L2 norms and the sigmoid 8 times over, and each of those is a
-//     Vector->Scalar round trip, which this architecture pays dearly for
-//     (no scalar `exp`).
-//   * the per-step instruction count is fixed, so a narrow tile pays the same
-//     PipeBarrier and issue latency for an eighth of the work. The prefill
-//     consumer measures ~3000 cycles/token at BV=16 for ~162 repeat-iterations
-//     of actual vector work — that ratio is the overhead a coarse tile
-//     amortizes.
-//
-// So one core owns one (request, head): BV = 128, the whole value axis, with
-// the 64 KB state tile resident in UB for the entire token loop. Measured on
-// the Triton baseline the same preference shows up as a monotonic win for
-// coarse tiles (BV 16/32/64 -> 85.2/52.6/40.3 us on the priority shape), and it
-// stops there only because BV=128 does not compile under Triton at all — the
-// [BV,BK] tile plus its live temporaries overflow UB in the BiShengIR pipeline
-// ("requires 2383872 bits while 1572864 bits available"). An Ascend C kernel
-// with a hand-laid map is not bound by that: the state tile and its reduction
-// scratch are 96 KB of the 192 KB budget, and nothing else here is large.
-//
-// This holds even where it leaves the device half idle. The 512K shapes give
-// the grid 32 and 16 blocks against 40 cores, and splitting their heads to fill
-// it measures worse, not better (see `V_TILES` at the instantiations below).
-// Those shapes are serial in the token index rather than short of parallelism,
-// and a value split does not change the critical path — it just runs the
-// per-token prologue several times.
-//
-// Keeping the state in UB across all steps is the other half of it. The
-// recurrence is serial in the token index, so a per-step launch has to spill
-// the state to GM and reload it; fusing the steps means one load, and the only
-// GM traffic left is the checkpoints the caller actually asked for. On the
-// priority shape four separate launches measure 78.4 us against 41.1 us fused.
-//
-// ── What this costs in traffic ────────────────────────────────────────
-//
-// Per (request, head): one 64 KB state load, then 64 KB per checkpoint. At
-// H=32 with 2 requests and 4 steps that is 64 items x 320 KB = 20 MB, ~17 us
-// at the ~1150 GB/s this device sustains. The checkpoints are 80% of it. That
-// is the floor this kernel is working against, and it is a caller-side
-// decision, not a tiling one: upstream's own ReplaySSM path
-// (`enable_linear_replayssm_spec`) drops `intermediate_ssm` entirely and
-// replays the ring at commit instead. Parity with the generic Triton kernel is
-// what this file implements, so the checkpoints are written.
-//
-// Tracking is prefill-only, so the prefix-checkpoint store is compiled out and
-// H=32 has two instantiations: plain, and save-intermediate.
+
 
 #include "kernel_operator.h"
 #include "kda_varlen_recurrent.h"
@@ -98,22 +9,9 @@
 #include <acl/acl.h>
 #endif
 
-// The namespace and the class carry an `h32` suffix, and so does nothing else
-// in this file. The shared header defines a `kda_decode` namespace and a
-// `KdaVarlenRecurrentDecode` template that still link into the same library for
-// H=16/64; once this copy diverges, reusing either name across the two
-// definitions would be an ODR violation the linker is free to resolve either
-// way. The emitted kernel symbols (`kda_decode_k32*`) keep their names, because
-// the shared header no longer instantiates that width.
 namespace kda_decode_h32 {
 
 // Hardware event IDs, managed by hand as in the prefill kernels. Avoid 6/7.
-// Event ids are scoped per (source, destination) pipe pair, so the same id may
-// appear against two different pairs.
-//
-// The checkpoint and the output get separate V_MTE3/MTE3_V ids so both can be
-// in flight at once: the token loop issues the checkpoint and keeps going, and
-// the two stores overlap the output reduction that follows them.
 constexpr int32_t EVENT_MTE2_V_STATE = 0;
 constexpr int32_t EVENT_MTE2_V_IN = 1;
 constexpr int32_t EVENT_V_MTE3_OUT = 0;

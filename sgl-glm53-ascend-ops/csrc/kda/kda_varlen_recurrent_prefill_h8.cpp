@@ -1,42 +1,4 @@
 // GLM-5.3 KDA varlen recurrence — prefill kernel, H=8 (TP8).
-//
-// One packed sequence (numReq==1) and a long serial token loop. See
-// `kda_varlen_recurrent.h` for the shared contract and the reference semantics;
-// the host file validates everything before this launcher is reached.
-//
-// ── Why this is H=4 run twice ─────────────────────────────────────────
-//
-// Same grid as H=4 — 32 consumers plus 8 producers, one scheduler wave on a
-// 910B's 40 vector cores — but H=8 has 64 (head, value tile) work items where
-// H=4 has 32. So each consumer runs the token loop twice, once per head:
-//
-//     round 0: heads 0..3      round 1: heads 4..7
-//
-// with the same (headSlot, value tile) decomposition inside each round. The
-// alternative was to interleave two value tiles inside one token loop, which
-// is what the earlier skeleton in this file proposed on the grounds that the
-// loop is latency-bound. Measured, it is not: the consumer's `aiv_vec_ratio`
-// is 0.93, so only ~7% of the vector pipe is idle and a second tile has
-// nowhere to hide. Two serialized rounds of `prepared_recurrent` confirm the
-// same thing end to end, at exactly 2.00x the H=4 time.
-//
-// Serial rounds also cost nothing in UB. Round 0 stores its state tile before
-// round 1 loads over it, so the one 8 KB buffer serves both and the H=4 UB map
-// carries over unchanged — interleaving would have needed a second tile.
-//
-// What two rounds does leave on the table is the round boundary: a state
-// store, a state load, and a cold prefetch with no outstanding loads to cover
-// it. So the next round's first token is prefetched *before* the state store
-// that ends the current round, which is the one place this file's token loop
-// differs from H=4's. Everything inside the loop is identical, deliberately:
-// the recurrence is bit-exact against upstream at H=4 and the arithmetic must
-// not move.
-//
-// Producers need no restructuring. At H=4 two producers feed each of 4 heads;
-// here the same two feed that head slot in round 0 and again in round 1, so the
-// (producer, consumer) pairing and its notification banks are unchanged. A
-// producer walks its head's chunks for round 0, then for round 1, in the order
-// its consumers consume them, so one ring of `eventID`s still serves both.
 
 #include "kernel_operator.h"
 #include "kda_varlen_recurrent.h"
@@ -49,8 +11,6 @@
 // ── Device-side ────────────────────────────────────────────────────────
 
 // Hardware event IDs, managed by hand as in `prepared_recurrent`. Avoid 6/7.
-// Producer and consumer never run on the same core, so the two sets may reuse
-// ids freely; they are kept distinct anyway to keep traces readable.
 namespace {
 
 // Consumer, lifted from `prepared_recurrent.cpp` via the H=4 kernel.
@@ -74,10 +34,6 @@ constexpr int32_t EVENT_V_MTE3_PROD = 2;
 constexpr int32_t EVENT_MTE3_V_PROD = 3;
 constexpr int32_t EVENT_MTE3_S_PROD = 4;
 constexpr int32_t EVENT_V_MTE2_PROD = 5;
-// This architecture has no scalar `exp`, so every sigmoid and every exp in the
-// producer round-trips through the Vector unit: Scalar writes the operand to UB,
-// Vector computes, Scalar reads the result back. Both directions need a real
-// hardware event — `PipeBarrier<PIPE_V>` does not order Vector against Scalar.
 constexpr int32_t EVENT_S_V_PROD = 0;
 constexpr int32_t EVENT_V_S_PROD = 0;
 
@@ -141,19 +97,9 @@ private:
                       "each head slot needs at least one producer");
     };
 
-    // UB map, identical to the H=4 kernel's. The consumer half is
-    // `prepared_recurrent`'s map at the same addresses, deliberately: the token
-    // loop's repeat strides are derived from these offsets. The producer half
-    // and the sync scratch go in the 57 KB hole that map leaves between the
-    // state tile (8 KB at 0x0) and 0x10100.
-    //
-    // Two rounds do not widen this. Round 0's state tile is stored to GM before
-    // round 1 loads into the same buffer, and every other buffer here is
-    // per-token scratch that neither round outlives.
     struct UbLayout {
         // ── shared ──
-        // 32 B of private scratch for the IBSet/IBWait handshake. Every core
-        // needs its own; this one is read and written by the sync API only.
+        // 32 B of private scratch for the IBSet/IBWait handshake. 
         static constexpr uint32_t SYNC_ADDR = 0x02000;
         static constexpr uint32_t SYNC_SIZE = 32;
 
@@ -413,12 +359,6 @@ __aicore__ inline void KdaVarlenRecurrentPrefillH8<TRACK_STATE, H_TOTAL>::Init(
         AscendC::TPosition::VECCALC, UbLayout::OUT_ADDR, BV);
 }
 
-// ── State tile movement ────────────────────────────────────────────────
-//
-// GM holds each state slot as [V, K] with K contiguous: the pool is allocated
-// [slots, H, V, K] and handed to the kernel as a transposed view, so stride(K)
-// is 1. The token loop wants [V, K] too, so the reduction over K runs along
-// contiguous lanes — the orientations agree and a tile is a contiguous span.
 
 template<bool TRACK_STATE, uint32_t H_TOTAL>
 __aicore__ inline void
@@ -441,10 +381,6 @@ KdaVarlenRecurrentPrefillH8<TRACK_STATE, H_TOTAL>::StoreStateTile(
     const AscendC::LocalTensor<float>& state,
     uint64_t gmOffset)
 {
-    // The mirror of `LoadStateTile`: same orientation on both sides, so the
-    // tile leaves as BV contiguous rows. Each tile owns a disjoint, 64 B
-    // aligned span of GM (BV * D floats = 8 KB), so concurrent stores from the
-    // 8 consumers of a head cannot share a datablock.
     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(1);
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(1);
 
@@ -1246,9 +1182,6 @@ DEFINE_KERNEL(kda_varlen_recurrent_kernel_track_h8, true,  8)
 
 void LaunchKdaPrefillH8(const KdaLaunchArgs &args, void *stream)
 {
-    // The same 40 blocks as H=4: 32 consumers (8 value tiles x 4 head slots)
-    // plus 8 producers, one wave on a 910B's vector cores. Each consumer runs
-    // the token loop twice, once per head. See `kda_prefill` in the header.
     constexpr uint32_t blockDim = kda_prefill::kBlockDim;
     auto acl_stream = static_cast<aclrtStream>(stream);
 
