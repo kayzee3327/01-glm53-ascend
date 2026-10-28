@@ -18,6 +18,16 @@ not what it runs:
               one, so it is the comparison that decides whether the new kernel
               is worth shipping. It covers prefill H4/H8 with one packed
               sequence and no checkpoints; every other row reports ``-``.
+``fla``       ``fla_npu.ops.ascendc.recurrent_kda``, Tianjin University's fused
+              KDA recurrence from flash-linear-attention-npu. An outside
+              implementation of the same function, so it answers a question the
+              other two cannot: whether a gap is this op or this hardware. It
+              computes the gate, the L2 norm and the beta sigmoid in-kernel from
+              the model's own tensors, like ours and unlike ``prepared``. Well
+              behind on prefill and at parity on decode, which localizes its
+              deficit to block mapping rather than to the recurrence -- see
+              ``README.md``. Checkpoints are out of scope, so ``verify`` rows
+              report ``-``.
 
 Regimes are the deployed parallel strategies, ``H = 64 / attn_tp_size``:
 prefill at H=4/8 (TP16/TP8), decode at H=16/32/64 (TP4/TP2/TP1). A regime whose
@@ -60,6 +70,8 @@ from sglang.srt.hardware_backend.npu.attention.glm53.kda_recurrent_npu import (
     glm_kda_varlen_recurrent_npu,
 )
 
+from fla_npu.ops.ascendc import recurrent_kda as fla_recurrent_kda
+
 from benchmark import (
     BenchmarkConfig,
     NpuEventMeasurer,
@@ -86,6 +98,18 @@ ATOL = 1e-6
 # Built via `make_comparator` so a failure reports its mismatch count against
 # these tolerances rather than against the framework's defaults.
 comparator = make_comparator(rtol=RTOL, atol=ATOL)
+
+# The `fla` arm is the one comparison that is not our own code on both sides,
+# so it is the one that cannot be held to the tolerance above. Measured, it
+# lands 1-2 bf16 ulps out on ~20 of 2M output elements at ~1e-4 magnitude, with
+# the state pool matching inside `RTOL` everywhere — a different summation
+# order in a recurrence whose output is small, not a different recurrence.
+# bf16's own `assert_close` default is the honest bar for that, and keeping it
+# on this arm alone is what preserves the tight one for `triton`/`prepared`,
+# where bit-exactness is a real property worth failing on.
+FLA_RTOL = 1.6e-2
+FLA_ATOL = 1e-5
+fla_comparator = make_comparator(rtol=FLA_RTOL, atol=FLA_ATOL)
 
 PREFILL_HEADS = (4, 8)  # TP16 / TP8
 PREFILL_TOKENS = (1024, 2048, 4096, 8192, 16384)
@@ -322,6 +346,100 @@ def glm_kda_varlen_recurrent_prepared(
     return output
 
 
+def glm_kda_varlen_recurrent_fla(
+    *,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b: torch.Tensor,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float,
+    scale: float,
+    one_token_per_seq: bool,
+) -> torch.Tensor:
+    """flash-linear-attention-npu's fused KDA recurrence on the caller's tensors.
+
+    The three gate switches below are what make this the same function as the
+    other arms rather than a near miss: ``safe_gate`` selects
+    ``lower_bound * sigmoid(exp(A_log) * (a + dt_bias))``, which is the gate
+    sglang's Triton kernel computes inline, and the L2 norm and beta sigmoid are
+    likewise the ones that kernel applies per token. So this arm reads the
+    model's own tensors, like ours, and unlike ``prepared``'s FP32 preparation.
+
+    Each regime is handed to the op in the spelling it accepts natively, which
+    is what keeps this a kernel measurement rather than a measurement of
+    conversions the caller would never perform:
+
+    ``one_token_per_seq``  decode and verify. The op's BSND is ``[B,T,H,D]``
+        and splits by batch row when given no ``cu_seqlens``, so one token per
+        request is ``[B,1,H,D]`` — the same bytes as our ``[1,B,H,D]``, reached
+        by ``view`` with no copy. Slots take the documented speculative
+        ``[seq_num,max_step]`` form, one row per request and one step.
+    otherwise  packed prefill, where the tokens of a sequence are contiguous
+        and there is no batch axis to carry them. That is TND, and there slots
+        are genuinely per token: the 1D form is read at the packed token
+        offset, so the per-request indices have to be expanded across each
+        request's length.
+
+    ``initial_state`` is the pool's V-first base: ``native_state`` allocates
+    ``[slots,H,V,K]`` contiguous and hands out the ``[slots,H,K,V]`` transpose,
+    so transposing back recovers the contiguous V-first orientation this op
+    wants while still aliasing the caller's pool, keeping the in-place final
+    state landing where the other arms write it.
+    """
+    state = initial_state_source.transpose(-1, -2)
+    if not state.is_contiguous():
+        raise ValueError("fla arm expects the V-first state pool base")
+
+    if one_token_per_seq:
+        requests = q.shape[1]
+        q, k, v, a = (t.view(requests, 1, *t.shape[2:]) for t in (q, k, v, a))
+        b = b.view(requests, 1, b.shape[2])
+        layout = "BSND"
+        # [seq_num, max_step] with max_step == 1.
+        slots = initial_state_indices.reshape(-1, 1).to(torch.int32)
+        offsets = None
+    else:
+        q, k, v, a, b = (t.squeeze(0).contiguous() for t in (q, k, v, a, b))
+        layout = "TND"
+        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int64)
+        slots = initial_state_indices.repeat_interleave(lengths).to(torch.int32)
+        offsets = cu_seqlens
+
+    out, _ = fla_recurrent_kda(
+        q,
+        k,
+        v,
+        a,
+        b,
+        state,
+        cu_seqlens=offsets,
+        ssm_state_indices=slots,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        layout=layout,
+        scale=scale,
+        output_final_state=False,
+        inplace_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        safe_gate=True,
+        lower_bound=lower_bound,
+        state_v_first=True,
+    )
+    if one_token_per_seq:
+        # Back to the [1,T,H,V] the other arms return, again without a copy:
+        # [B,1,H,V] -> [1,B,H,V], where B is the token count.
+        return out.view(1, out.shape[0], *out.shape[2:])
+    return out.unsqueeze(0)
+
+
 @dataclass
 class Case:
     """One recurrence invocation. ``state`` is written in place."""
@@ -339,6 +457,12 @@ class Case:
     prefill: bool
     # Per-step checkpoints, or None outside the verify regime.
     intermediate: Optional[torch.Tensor] = None
+    # Whether every request carries exactly one token, which is what lets the
+    # `fla` arm use the op's native BSND spelling. Recorded at construction
+    # from the host-side lengths: deriving it from `starts` inside the launch
+    # would put a device-to-host sync in the timed region, which on a ~0.12ms
+    # decode call costs more than the kernel.
+    one_token_per_seq: bool = False
 
 
 def native_state(slots: int, heads: int) -> torch.Tensor:
@@ -421,6 +545,7 @@ def make_case(
         intermediate=(
             native_intermediate(batch, max(lengths), heads) if checkpoints else None
         ),
+        one_token_per_seq=all(length == 1 for length in lengths),
     )
 
 
@@ -455,6 +580,27 @@ def prepared_launch(case: Case) -> torch.Tensor:
     kwargs = call_kwargs(case)
     del kwargs["intermediate_state"], kwargs["prefill"]
     return glm_kda_varlen_recurrent_prepared(**kwargs)
+
+
+def fla_launch(case: Case) -> torch.Tensor:
+    kwargs = call_kwargs(case)
+    del kwargs["intermediate_state"], kwargs["prefill"]
+    return glm_kda_varlen_recurrent_fla(
+        **kwargs,
+        one_token_per_seq=case.one_token_per_seq,
+    )
+
+
+def fla_supported(case: Case) -> bool:
+    """Whether the op covers this regime.
+
+    Only checkpoints are out of scope: the op writes one state per token into
+    the pool and has no per-step checkpoint tensor, so there is nothing for a
+    ``verify`` row to validate against. Prefill and decode are both in scope —
+    unlike CANN's ``RecurrentKda``, which capped a sequence at 8 tokens (see
+    DISCARDED-cann-recurrent-kda.md).
+    """
+    return case.intermediate is None
 
 
 def prepared_supported(case: Case) -> bool:
@@ -520,11 +666,12 @@ def fresh(case: Case, contiguous_state: bool = False) -> Case:
 
 
 def bench_one(case: Case):
-    """One row: the op against the generic recurrence and the deployed path.
+    """One row: the op against the generic recurrence, the deployed path and fla.
 
-    The prepared arm is dropped on regimes the caller would not route to it, so
-    its columns read ``-`` there rather than comparing against a path that is
-    not in production for that shape.
+    An arm is dropped on regimes it does not cover, so its columns read ``-``
+    there rather than comparing against something that is not a candidate for
+    that shape: ``prepared`` where the caller would not route to it, ``fla``
+    where checkpoints are required.
     """
     references = []
 
@@ -539,6 +686,16 @@ def bench_one(case: Case):
             prepared_launch, fresh(case, contiguous_state=True)
         )
         references.append(Reference("prepared", prepared_run, prepared_output))
+
+    if fla_supported(case):
+        # Carries its own tolerance: see `fla_comparator`. It is the only arm
+        # here that is not our own code, so holding it to the bit-exact bar the
+        # others meet would fail the row over bf16 rounding and take the whole
+        # row's timings down with it.
+        fla_run, fla_output = arm(fla_launch, fresh(case))
+        references.append(
+            Reference("fla", fla_run, fla_output, comparator=fla_comparator)
+        )
 
     target_run, target_output = arm(ascendc_launch, fresh(case))
     return benchmark(
@@ -683,11 +840,20 @@ def print_table(rows):
             "                  kernel, the deployed prefill path; '-' where the\n"
             "                  caller would not route to it"
         )
+    if "fla" in names:
+        print(
+            "fla             : flash-linear-attention-npu's fused recurrent_kda;\n"
+            "                  '-' on verify, which needs per-step checkpoints.\n"
+            f"                  Validated at rtol={FLA_RTOL:g} atol={FLA_ATOL:g}, "
+            "bf16's own default,\n"
+            "                  because it is the one arm that is not our code"
+        )
     print("vs <ref>        : median(ref) / median(ours), >1 means ours is faster")
 
 
 def main():
     print(f"tolerance: rtol={RTOL} atol={ATOL}")
+    print(f"           fla arm: rtol={FLA_RTOL:g} atol={FLA_ATOL:g}")
     print()
 
     rows = []

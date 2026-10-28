@@ -3,6 +3,9 @@
 __pycache__
 .build_cache/
 build/
+# Custom op package build logs and JIT bridge output
+*.log
+.build_cann_op/
 extra-info
 .clangd
 compile_commands.json
