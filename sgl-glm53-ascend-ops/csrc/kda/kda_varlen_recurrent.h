@@ -8,9 +8,15 @@
 //   kda_varlen_recurrent.cpp               host: validation, dispatch, registration
 //   kda_varlen_recurrent_prefill_h4.cpp    H=4  (TP16), plain + track
 //   kda_varlen_recurrent_prefill_h8.cpp    H=8  (TP8),  plain + track
-//   kda_varlen_recurrent_decode_h16.cpp    H=16 (TP4)
-//   kda_varlen_recurrent_decode_h32.cpp    H=32 (TP2)
-//   kda_varlen_recurrent_decode_h64.cpp    H=64 (TP1)
+//   kda_varlen_recurrent_decode_h16.cpp    H=16 (TP4), shared template
+//   kda_varlen_recurrent_decode_h64.cpp    H=64 (TP1), shared template
+//   kda_varlen_recurrent_decode_h32.cpp    H=32 (TP2), own implementation
+//
+// H=16 and H=64 instantiate the width-generic template in
+// `kda_varlen_recurrent_decode.h`. H=32 was forked out of it: it is the
+// priority decode shape (DP4TP2 at 256K), so it is tuned on its own and a
+// change there must not move the other two widths. The two prefill widths share
+// nothing to begin with.
 //
 // The two prefill files are separate because H=4 and H=8 differ in how many
 // times a consumer runs the token loop, not in the grid: both launch the same

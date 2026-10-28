@@ -1,8 +1,16 @@
-// GLM-5.3 KDA varlen recurrence — decode kernel, shared across H=16/32/64.
+// GLM-5.3 KDA varlen recurrence — decode kernel, shared across H=16/64.
 //
-// Device-side only. Included by the three decode translation units, each of
+// Device-side only. Included by the H=16 and H=64 translation units, each of
 // which instantiates it for its own H and defines its launcher. See
 // `kda_varlen_recurrent.h` for the shared contract and the reference semantics.
+//
+// H=32 was forked out of this file into `kda_varlen_recurrent_decode_h32.cpp`
+// and no longer instantiates from here. It is the priority decode shape, so it
+// is being tuned past what a width-generic kernel can express, and leaving it
+// here would drag the other two widths along with every change. The fork
+// started as a verbatim copy of this file, so it is the place to look for what
+// has been tried on the token loop since; anything that turns out not to be
+// H=32-specific belongs back here.
 //
 // ── What decode actually is ────────────────────────────────────────────
 //
@@ -73,6 +81,10 @@
 //
 // Tracking is prefill-only, so the prefix-checkpoint store is compiled out and
 // each H has two instantiations: plain, and save-intermediate.
+//
+// The H=32 numbers quoted throughout this file are the shape the tiling was
+// chosen on, kept because they are what the decisions rest on. They are now
+// measurements of the forked kernel, not of this one.
 
 #pragma once
 
@@ -121,7 +133,9 @@ constexpr uint32_t kStepGroup = 4;
 //                    the generic Triton kernel's `if not SAVE_INTERMEDIATE and
 //                    state_index > 0` guard: the commit takes the accepted step
 //                    out of the checkpoint buffer instead.
-// H_TOTAL            heads per state slot; 16/32/64 for decode at TP4/TP2/TP1.
+// H_TOTAL            heads per state slot; 16 or 64 for decode at TP4/TP1.
+//                    H=32 (TP2) has its own file and does not come through
+//                    here.
 // V_TILES            cores per head, splitting the value axis. 1 unless the
 //                    shape has too few (request, head) pairs to fill the
 //                    device — see `PickVTiles` below.

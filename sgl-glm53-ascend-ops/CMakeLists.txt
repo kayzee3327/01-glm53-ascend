@@ -121,6 +121,10 @@ set(_SRC_prepared_recurrent    csrc/kda/prepared_recurrent.cpp)
 # prefill H4/H8 and decode H16/H32/H64 each want their own tiling and block
 # mapping. They build as a single OBJECT target because they are one op — a
 # partial set would link to an unresolved launcher.
+#
+# Decode H16/H64 are thin instantiations of the shared template in
+# csrc/kda/kda_varlen_recurrent_decode.h; H32 carries its own copy of the
+# implementation, because it is the priority decode shape and is tuned alone.
 set(_SRC_kda_varlen_recurrent
     csrc/kda/kda_varlen_recurrent.cpp
     csrc/kda/kda_varlen_recurrent_prefill_h4.cpp

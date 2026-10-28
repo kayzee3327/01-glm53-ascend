@@ -29,9 +29,9 @@
 // `kda_varlen_recurrent.h`, which also documents the split, the division of
 // labour with the caller, and the shared contract (state layout, reference
 // semantics). Registration stays here and only here: `TORCH_LIBRARY_FRAGMENT`
-// may define the schema once. The three decode widths share one device
-// template in `kda_varlen_recurrent_decode.h`; the two prefill widths do not
-// share anything.
+// may define the schema once. Decode H=16 and H=64 share one device template in
+// `kda_varlen_recurrent_decode.h`; H=32 is forked out of it and tuned on its
+// own, and the two prefill widths share nothing.
 
 #include "kda_varlen_recurrent.h"
 
