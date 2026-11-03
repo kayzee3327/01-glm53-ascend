@@ -6,9 +6,10 @@ was wired in as a fourth arm, measured, and removed on 2026-10-27. It is kept
 out because it is slow enough on this hardware to be uninformative, not because
 it is wrong — it passed validation on every row it could run.
 
-The sibling bench in `../kda_chunk` still has a CANN arm. That is not an
-inconsistency: `ChunkKdaFwd` is 3-6x *faster* than the Triton arm there, so it
-is worth comparing against. This op is the opposite result.
+The sibling bench in `../kda_chunk` kept a CANN arm for a while, and that was
+not an inconsistency: `ChunkKdaFwd` is 3-6x *faster* than the Triton arm there,
+so it was worth comparing against, where this op is the opposite result. That
+arm has since been removed too, for an unrelated reason — see that README.
 
 ## What it measured
 
@@ -109,9 +110,10 @@ way out of a vector-bound regime.
 
 Removing this arm does **not** make the `CalcComputeUbCoeff` fix removable. It is
 still uncommitted in the working tree of `/data/wangkaize/ops-transformer`, and
-a fresh clone or a checkout that resets that file brings the overflow back. The
-`kda_chunk` bench builds `chunk_kda_fwd` from the same tree, and upstream's
-`recurrent_kda` pytest suite needs it to pass at all.
+a fresh clone or a checkout that resets that file brings the overflow back.
+Upstream's own `recurrent_kda` pytest suite needs it to pass at all. (The
+`kda_chunk` bench used to build `chunk_kda_fwd` from the same tree and no longer
+does, so that is one fewer consumer, not zero.)
 
 Diagnosing a recurrence: an all-NaN `out` whose NaNs are confined to even V
 columns at ~1/256 density means the kernel never wrote the buffer, i.e. the
@@ -121,9 +123,10 @@ patch is missing. Re-apply, then rebuild.
 
 `git log -- bench/kda_recurrent/` — the arm was `glm_kda_varlen_recurrent_cann`
 plus `cann_supported`/`cann_state` in `bench_kda_varlen_recurrent.py`, and two
-helper files, `cann_op.py` and `build_cann_op.py`. The surviving copies in
-`../kda_chunk` are the same scripts apart from `OP_NAME`, `VENDOR` and
-`NEEDS_WHEEL`, so that directory is the better starting point than the history.
+helper files, `cann_op.py` and `build_cann_op.py`. `../kda_chunk` used to carry
+the same two scripts apart from `OP_NAME`, `VENDOR` and `NEEDS_WHEEL`, and was
+the better starting point than this history — they were deleted with that
+bench's arms, so both copies now live only in `git log`.
 
 Two things about the build are worth not rediscovering:
 

@@ -1,18 +1,53 @@
 # chunk KDA benchmark
 
-Compares four implementations of the chunked KDA prefill forward on the shapes
-GLM-5.3 prefill runs.
+Measures our Ascend C chunked KDA prefill kernel on the shapes GLM-5.3 prefill
+runs, against the two outside kernels that implement the same operator.
 
 | arm | what it is | status |
 | --- | --- | --- |
-| `cann` | `ChunkKdaFwd` from CANN 9.2.0's [ops-transformer](https://gitcode.com/cann/ops-transformer/tree/9.2.0/attention/chunk_kda_fwd) | built from source, see below |
-| `triton` | `triton_kda_chunk.py`, written for this comparison | working |
-| `fla` | `chunk_kda_fwd` from [flash-linear-attention-npu](https://github.com/flashserve/flash-linear-attention-npu) (Tianjin University) | working; `chunk_size=64` only |
-| `ascendc` | the kernel in the sglang GLM-5.3 plugin | not implemented; reports `-` |
+| `ascendc` | the kernel in the sglang GLM-5.3 plugin — the target | not implemented; `run_ascendc` raises |
+| `cann` | CANN 9.2.0's `ChunkKdaFwd`, via `ref_ops.cann` | runs, C64 and C128 |
+| `fla` | flash-linear-attention-npu's, via `ref_ops.fla_npu` | runs, C64 only |
+| `torch` | the correctness anchor | blank by design; `run_torch` raises |
 
-`cann` and `fla` cannot run in the same process — see
-[One process per vendor](#one-process-per-vendor), which is why a run prints two
-tables.
+The two reference arms come from the [`ref_ops`](../../../../ref_ops) package.
+That package is the reason they can both be columns in one table: both upstreams
+register op type **`ChunkKdaFwd`**, CANN's launcher registry is keyed by that
+string, and the second to resolve used to lose — `cann` segfaulting, `fla`
+raising `ADD_TO_LAUNCHER_LIST_AICORE ChunkKdaFwd failed`, with path ordering
+unable to fix it in either direction. `ref_ops` ships *renamed* copies of the
+CANN-side ops, so the collision is dissolved rather than worked around and no
+per-vendor process or re-exec is needed here. `ref_ops/AGENTS.md` is the install
+and pin-bump procedure.
+
+`import ref_ops` happens at module scope and must stay there: it builds the
+aclnn dlsym search path, and `GetCustOpApiHandlers` caches that path in a
+static on the *first* operator launch in the process. An import deferred into an
+arm would run after the target had already launched, leaving both vendors
+unreachable for the rest of the run.
+
+## Measured bar
+
+From a full run on an idle card 4, with `ascendc` absent so `cann` stands in as
+the denominator:
+
+| shape | `cann` | `fla` |
+| --- | --- | --- |
+| H4 C64, T1k → T16k | 0.85 → 6.80 ms | 1.38 → 7.10 ms |
+| H8 C64, T1k → T16k | 0.95 → 8.83 ms | 1.26 → 9.01 ms |
+| H4 C128, T1k → T16k | 0.82 → 6.28 ms | — |
+| H8 C128, T1k → T16k | 0.95 → 8.43 ms | — |
+
+`cann` leads `fla` by 1.6x at T1k narrowing to 1.02-1.04x at T16k, so the two
+converge where the shapes are large enough to stop being launch-bound. C128 buys
+`cann` a few percent over C64. This is the bar the target is aiming at.
+
+## Removed arms
+
+`triton`, plus `reference.py`, `test_reference.py`, `test_triton.py`,
+`triton_kda_chunk.py`, `cann_op.py` and `build_cann_op.py` — the last two being
+the per-bench build machinery that `ref_ops` replaced. `git log --
+bench/kda_chunk/` has all of it.
 
 ## Run it
 
@@ -26,243 +61,106 @@ measure something else, edit the constants. The script also pins
 `ASCEND_RT_VISIBLE_DEVICES=4` itself, since operator work on this machine is
 restricted to that card and forgetting the pin benchmarks on someone else's.
 
-The target is the arm speedups are quoted against. It defaults to `ascendc`,
-falling back to `triton` while that kernel does not exist. An unavailable arm is
-a skipped column rather than a failure.
+With no target kernel it does not exit 1 any more: the first live arm stands in
+as the denominator and the reference arms are measured anyway, labelled in the
+table so what is quoted against what stays readable. Only an empty arm set is
+fatal.
 
-## One process per vendor
+## Inputs
 
-`cann` and `fla` both register the op type **`ChunkKdaFwd`**, and CANN's
-launcher registry is keyed by that name. One slot, two claimants: whichever
-resolves second loses, and it does not lose cleanly — `cann` **segfaults**,
-while `fla` raises `ADD_TO_LAUNCHER_LIST_AICORE ChunkKdaFwd failed`. Path
-ordering cannot fix it, in either direction.
+Shapes, dtypes and distributions are `make_case` from
+`../kda_recurrent/bench_kda_varlen_recurrent.py`, down to the scale factors and
+the padding row at slot zero — `q`/`k`/`v`/`a` as `[1, T, H, D]` bf16, `b` as
+`[1, T, H]`, and the state pool allocated `[slots,H,V,K]` and viewed
+`[slots,H,K,V]`. That bench measures the recurrence this kernel replaces, so the
+two have to agree on their inputs or comparing them says nothing. The only
+addition here is `chunk_size`.
 
-So the arm is selected per process by `KDA_CHUNK_VENDOR`, and running the script
-bare re-executes it once per vendor:
+`prepare_tnd` does the per-arm adaptation: squeeze to TND, and L2-normalize
+`q`/`k` and sigmoid `beta` in fp32. The normalization is not a choice — the
+`ref_ops` CANN bridge exposes no `use_qk_l2norm_in_kernel` flag, and `fla`'s
+in-kernel path refuses every chunk size but 64, so the host form is the only one
+both arms can be measured in. It lives inside the arms rather than in
+`make_inputs` because the deployed path pays it per call, which also leaves the
+target free to fuse it and be credited.
 
-```bash
-python bench_kda_chunk.py                    # both, one table each
-KDA_CHUNK_VENDOR=fla python bench_kda_chunk.py   # just this one
-```
+The gate stays raw: `A_log`, `dt_bias` and the bounded sigmoid are applied
+in-kernel under `use_gate_in_kernel`, as the deployment runs it. The convention
+was confirmed end to end by checking `cann.chunk_kda` against
+`glm_kda_varlen_recurrent_npu` on the same inputs.
 
-The selection happens at import, before `torch_npu` loads, because two things
-are already settled by the first aclnn call: the dlsym handler list is cached in
-a function-local `static` for the life of the process, and `fla_npu`'s installed
-`.pth` prepends its own vendor at *interpreter start*, before any user code —
-so selecting `cann` means setting `FLA_NPU_DISABLE_PTH=1` as well as pointing
-`ASCEND_CUSTOM_OPP_PATH` at the glm53 vendors explicitly.
+## The two hooks
 
-`triton` and the target arm run under both vendors, which is what keeps the two
-tables comparable: the vendor-specific column changes, the baseline does not.
+`run_ascendc(inputs, case)` returns `(attn_out, final_state)` — `attn_out` as
+`[T, HV, V]` in the input dtype, `final_state` as fp32 `[N, HV, K, V]`, which is
+what both reference arms were verified to return. Nothing else needs to change:
+the arm is already wired into the probe, the validation and the table.
 
-A deselected arm is reported as `not selected: KDA_CHUNK_VENDOR=...` and is
-never probed. That matters more than it reads — the probe runs an arm to find
-out whether it exists, and probing the registration loser is the segfault.
+`run_torch(inputs, case)` returns the same pair, and is never timed. It is left
+blank deliberately — a hand-written anchor is the point of it. Two things about
+it are decided by how the frame uses it:
 
-The sibling benchmark in `../kda_recurrent` covers the recurrent KDA op the same
-way, so the two directories share the same four files: `bench_*.py`,
-`build_cann_op.py`, `cann_op.py`, `README.md`. The two `build_cann_op.py` are the
-same script apart from `OP_NAME`, `VENDOR` and `NEEDS_WHEEL`; the two
-`cann_op.py` share everything down to `available()` and then diverge, because
-only one of the two operators ships a Python binding.
+* Being obviously right is the only requirement, so it can be a literal
+  transcription of the formulas — `O(C^2 K)` temporaries and all — rather than
+  anything a kernel could run.
+* It should accumulate in fp64, which means running on CPU, because the NPU has
+  no fp64. `torch.testing.assert_close` wants matching dtypes, so either round
+  to the arm's dtype there or upcast at the comparison site in `bench_one`. The
+  tolerances below were set with the former, where the bf16 rounding alone costs
+  up to ~3.9e-3 relative.
 
-The four files here with no counterpart next door — `triton_kda_chunk.py`,
-`reference.py`, `test_reference.py`, `test_triton.py` — exist because this
-benchmark had to write its own comparison arms. The recurrent bench gets both of
-its non-CANN arms from sglang, which ships a Triton fallback for that op and
-nothing for this one.
+Until it exists, every `ok` column reads `-` rather than `PASS`. Timing a kernel
+before it can be checked is useful; calling it correct because nothing
+contradicted it is not — and the two reference arms agreeing is not a substitute,
+since they would agree on a shared misreading too.
 
-The `fla` arm exists in both benches and needs no per-vendor split next door:
-that one's CANN arm was dropped, so nothing there contests `RecurrentKda`. The
-collision is specific to having two live claimants on one op type.
-
-## The CANN arm needs a build first
-
-The installed toolkit is **CANN 9.0.0**, which does not ship this operator:
-`libopapi.so` has no `aclnnChunkKdaFwd` symbol and there is no kernel binary
-for it. The operator landed later, so the only way to measure the official
-implementation here is to compile the 9.2.0 sources against the 9.0.0 toolkit
-and install them as a **custom op package**, which loads alongside the built-in
-operators without modifying the installed toolkit.
-
-```bash
-python build_cann_op.py --check   # status, builds nothing
-python build_cann_op.py           # build and install (tens of minutes)
-```
-
-This runs, from the checkout at `/data/wangkaize/ops-transformer` (branch
-`9.2.0`):
-
-```
-bash build.sh --pkg --ops=chunk_kda_fwd --vendor_name=glm53chunk \
-              --soc=ascend910b --disable-check-compatible -jN
-```
-
-then installs the resulting `.run` package under
-`$ASCEND_OPP_PATH/vendors/glm53chunk_transformer/`.
-
-`--opkernel` is deliberately **not** passed, despite the name suggesting it is
-what builds the device kernel. It sets `ENABLE_OPKERNEL`, which `build.sh` tests
-*before* the `--ops`/`--vendor_name` branch of its dispatch chain, so it wins and
-runs `build_kernel` alone: kernel binaries get compiled, CPack is never invoked,
-and the build reports success having produced no `.run` at all. Without it the
-custom-op branch sets `ENABLE_OPS_KERNEL=ON` itself, so the kernel is still
-built and is also packaged.
-
-Why a cross-version build is expected to work: the operator declares
-`ascend910b` support directly (`op_host/chunk_kda_fwd_def.cpp` calls
-`AICore().AddConfig("ascend910b", ...)` alongside `ascend910_93` and
-`ascend950`), and the repo's own compatibility gate is already forced `OFF` in
-`cmake/config.cmake`. `--disable-check-compatible` is passed anyway so this does
-not depend on that line staying as it is. If a future checkout starts depending
-on a 9.2-only toolkit header, that surfaces here as a compile error naming the
-header.
-
-The build is serialized by a lock file in the ops-transformer checkout, because
-that tree has a single shared `build/` directory and a concurrent build from
-the same checkout — the neighbouring bench builds `recurrent_kda` from it — would
-corrupt it.
-
-The two benches install under *different* vendor names (`glm53chunk` here,
-`glm53recurrent` next door), and that is load-bearing rather than cosmetic. The
-installer clears same-named files out of the vendor directory it is installing
-into, and every single-op build ships its own `libcust_opapi.so`, so a shared
-vendor name would mean whichever bench built second silently deleted the other's
-operator. Separate names let both sit in `opp/vendors/` at once; the aclnn
-`dlsym` search walks every vendor directory, so each bench still finds its own
-op. `cann_op.py` checks for `aclnnChunkKdaFwd` by name for that reason — the
-sibling's package alone is enough to make a directory scan succeed.
-
-## The fla arm needs no build
-
-It comes from the installed `flash-linear-attention-npu` wheel plus its run
-package, so there is no loader and no JIT bridge here — just an import. The
-install is scenario 1 of that repo's `docs/开发者指南.md`:
-
-```bash
-cd /data/wangkaize/flash-linear-attention-npu
-bash build.sh --soc=ascend910b --pkg --vendor_name=fla_npu \
-              --ops=recurrent_kda,chunk_kda_fwd
-cd torch_custom/fla_npu && python setup.py bdist_wheel
-pip install --force-reinstall --no-cache-dir --no-deps dist/*.whl
-./build_out/fla_npu_linux-aarch64.run --install
-```
-
-Both ops go in one `.run`: each single-op build ships its own
-`libcust_opapi.so`, so building them separately under one vendor name would
-make the second install delete the first.
-
-Two things that are not obvious from that guide. The wheel is **not** optional
-even though scenario 1 describes replacing an op in an already-installed wheel —
-the `.run` carries only Ascend C artifacts, so a venv without `fla_npu` needs
-both. And `scripts/check_npu_env.py` fails here on `torch_npu` 2.10.0 vs the
-2.10.0.post2 it wants; that gate only applies under
-`FLA_NPU_BUILD_LEGACY_EXTENSION=1`, and the default Stable-ABI build skips the
-torch checks entirely, so it does not block this.
-
-`chunk_size=128` is rejected by the operator's own parameter validation
-(`chunkSize only supports 64.`) and documented as out of range, so the C128 rows
-report `-` rather than `FAIL`. The arm is dropped per row for that, not per run.
-
-### How the Python binding works
-
-`chunk_kda_fwd` has no `torch_extension/` wrapper upstream, unlike its sibling
-`recurrent_kda`, so there is no ready-made entry point to import and no wheel to
-build (`NEEDS_WHEEL = False`). `cann_op.py` supplies one instead: a small C++
-bridge calling `aclnnChunkKdaFwd` through ops-transformer's own `ACLNN_CMD`
-macro, JIT-compiled by `torch.utils.cpp_extension.load` using `OpBuilder`'s
-include and link paths.
-
-That macro resolves the symbol with `dlsym` and searches the custom vendor
-packages' `libcust_opapi.so` *before* the built-in `libopapi.so`, which is
-precisely what lets a 9.2.0-built operator run on a 9.0.0 toolkit. It looks in
-`ASCEND_CUSTOM_OPP_PATH` and `LD_LIBRARY_PATH`, and CANN's `set_env.sh` points
-neither at the vendors directory, so `cann_op.py` sets both itself once it has
-found the package that exports the symbol. It exposes *every* vendor package it
-found, not just the one it wanted: the handler list is built on the first aclnn
-call in the process and cached in a function-local `static`, so whatever is on
-the path at that moment is all the process will ever search.
+Note that the chunked algebra is where the subtlety lives — the WY
+representation, the triangular inverse, the chunk-local gate rebasing — so a
+reference is not self-validating either. The deleted `test_reference.py` checked
+it against a token-at-a-time delta-rule scan that shares none of that
+machinery, which is the check worth repeating. The reference arms are a second
+opinion available now that it was not before: an anchor that disagrees with both
+of them is more likely wrong than they are.
 
 ## Correctness
 
-Not decided between the arms. Each is checked against `reference.py`, a direct
-transcription of the operator's documented formulas, and an arm that disagrees
-is reported `FAIL` rather than quietly becoming the baseline.
+Each arm is checked against `run_torch` independently, in `bench_one`, not
+against the target. An arm that disagrees is reported `FAIL` rather than quietly
+becoming the baseline — which also means the framework's own
+target-vs-reference comparison is deliberately bypassed with a comparator that
+accepts anything. With two reference arms this matters more than it did with
+none: they agree with each other to a bf16 ulp, so a shared misreading of the
+inputs would look like consensus.
 
-`reference.py` is in turn verified against a token-at-a-time recurrence — the
-delta rule with no chunking anywhere — in `test_reference.py`. That is the real
-check on the chunked algebra: the WY representation, the triangular inverse and
-the chunk-local gate rebasing are where the subtlety lives, and a sequential
-scan shares none of it.
+`RTOL = 2e-2`, `ATOL = 2e-4`, for bf16 inputs accumulated in fp32.
 
-```bash
-python test_reference.py   # chunked algebra vs sequential scan, CPU only
-python test_triton.py      # the Triton kernels vs the fp64 reference, on NPU
-```
+Which bound binds was measured on these inputs at H4 T1024 C64: `|attn_out|`
+runs ~5e-4 mean with a ~1.6e-2 max, so most of it sits under `atol` and `atol`
+is what decides there. `final_state` is larger (mean ~5e-3) and is where `rtol`
+does the work. The disagreement the tolerances have to admit is measured, not
+guessed: `cann` and `fla` differ by ~1 bf16 ulp on identical inputs, and `cann`
+against the deployed Triton recurrence differs by 6.1e-5 on `attn_out` and
+4.4e-4 on `final_state`. The pair is not vacuous — zeroing or halving
+`attn_out`, or zeroing `final_state`, each produced `FAIL` — but a regime that
+only perturbed the small bulk of `attn_out` would need `atol` tightened to be
+caught.
 
-Both run standalone or under pytest. The reference runs on CPU because the NPU
-has no fp64, and fp64 is the point of it.
+The validation path was exercised by standing `cann`'s own output in as the
+anchor (both arms `PASS`) and then halving it (both `FAIL`). Doing that found a
+latent bug, now fixed: `bench_one` moved each arm's output to the host but left
+the anchor wherever it was produced, and `assert_close` treats device as an
+attribute to match — so an NPU-resident anchor failed every comparison on the
+device alone, including against a bit-identical tensor. `run_torch` runs on CPU
+anyway, but the frame no longer depends on that.
 
-## Notes on the Triton implementation
+## Measurement caveat
 
-Five kernels, because that is what the data dependencies and the hardware
-budget allow:
-
-1. `kda_gates` — activate the gate, cumulative-sum it within each chunk, emit
-   the gate-scaled `q` and `k`. Tiled over K as well as (chunk, head).
-2. `kda_attn` — the chunk-local pairwise matrices `Aqk` and `L`.
-3. `kda_akk` / `kda_akk_merge` — invert `I + L`.
-4. `kda_scan` — the serial part: carry the state across a sequence's chunks.
-5. `kda_output` — `qg @ h + Aqk @ v_new`, chunk-parallel.
-
-Three things were forced by the target rather than chosen:
-
-**Pairwise decay must be rebased.** Reaching a matmul needs the separable form
-`(q 2^gk) (k 2^-gk)^T`, but the chunk-local cumulative gate falls by roughly
-175 in log2 across a 64-token chunk under the deployed bounded gate, and
-`2^175` overflows fp32 — the naive factoring yields `inf * 0 = NaN`. `kda_attn`
-splits each chunk into `BC`-row sub-tiles and rebases each pair to the first row
-of the column tile, so both factors stay bounded while their product is
-unchanged.
-
-**The triangular inverse is a doubling series, not row substitution.** `L` is
-strictly lower triangular, so `(I + L)^-1 = sum (-L)^p` terminates exactly;
-accumulating it by doubling needs `log2(BT)` steps against 63 serial ones, whose
-unrolled live temporaries overflow UB by about 2.5x. At `chunk_size=128` even
-that does not fit, so the inverse is hierarchical: `kda_akk` inverts `BB`-wide
-diagonal blocks and `kda_akk_merge` joins adjacent pairs one level at a time via
-`[[A,0],[C,D]]^-1 = [[A^-1,0],[-D^-1 C A^-1, D^-1]]`. Blocking below the 64 that
-UB forces is also a work reduction, since doubling costs `2 log2(n)` matmuls of
-`n^3` against two per merge — `BB=32` is about 22% of `BB=64`'s
-multiply-accumulates at `BT=128`.
-
-**Output is split from the scan.** Folding the output matmuls into the serial
-walk costs an extra `[BT, BT]` operand tile and overflows cbuf at
-`chunk_size=128`. The output is chunk-parallel anyway, so it does not belong in
-the one kernel that must run serially.
-
-## Results, and a measurement caveat
-
-Both outside kernels beat the Triton arm by a wide margin on C64, and by
-margins that widen with tokens: `cann` from 0.23x at T1k to 0.16x at T16k,
-`fla` from 0.29x to 0.17x. The two are close, `cann` ahead by 7-14% on
-matching rows. Triton is also the better arm at C128 than at C64 in absolute
-terms, which is what makes `cann`'s C128 ratios (0.25-0.34x) look weaker than
-its C64 ones without the kernel being slower.
-
-One thing worth not re-discovering: an early run produced 14.2ms and 45.8ms for
-`cann` at H8 T4096/T8192 C64 — against 5.45ms at the *larger* T16384, so
-plainly not a property of the kernel. Re-measured on an idle card they are
-1.50ms and 2.81ms, monotone in T. The outliers were contention from another
+A non-monotone latency column is a reason to re-measure before it is a reason to
+investigate the kernel. An early run produced 14.2ms and 45.8ms at H8
+T4096/T8192 C64 against 5.45ms at the *larger* T16384; re-measured on an idle
+card they were 1.50ms and 2.81ms, monotone in T. The outliers were another
 process on card 4. The pin at the top of the script stops you using someone
-else's card; it does not stop someone else using yours, so a non-monotone
-latency column is a reason to re-measure before it is a reason to investigate
-the kernel.
+else's card; it does not stop someone else using yours.
 
-## Adding the Ascend C arm
-
-Implement `run_ascendc` in `bench_kda_chunk.py` to dispatch to the op and return
-`(attn_out, final_state)` — `attn_out` as `[T, HV, V]` in the input dtype,
-`final_state` as fp32 `[N, HV, K, V]`. Nothing else needs to change: the arm is
-already wired into the probe, the validation and the table.
+The sibling benchmark in `../kda_recurrent` covers the recurrent KDA op and
+keeps two arms, `triton` and `prepared` — both the caller's own paths.
