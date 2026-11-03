@@ -17,6 +17,7 @@ namespace kda_decode {
 // the two stores overlap the output reduction that follows them.
 constexpr int32_t EVENT_MTE2_V_STATE = 0;
 constexpr int32_t EVENT_MTE2_V_IN = 1;
+constexpr int32_t EVENT_V_MTE2_IN = 2;
 constexpr int32_t EVENT_V_MTE3_OUT = 0;
 constexpr int32_t EVENT_V_MTE3_MID = 1;
 constexpr int32_t EVENT_MTE3_V_OUT = 0;
@@ -229,8 +230,11 @@ private:
     // exp(A_log[head]), hoisted per head.
     __aicore__ inline float HeadDecay(uint32_t head);
     // Fill qn/kn/gd/bt for `rows` tokens starting at GM token `tok0` of `head`.
+    // `reused` says the staged bf16 buffers still hold a previous group, which
+    // the refill has to wait out.
     __aicore__ inline void PrepareGroup(uint32_t head, uint32_t tok0,
-                                        uint32_t rows, float decay);
+                                        uint32_t rows, float decay,
+                                        bool reused);
     __aicore__ inline void StoreTile(uint64_t gmOffset);
     __aicore__ inline void RunItem(uint32_t req, uint32_t head, uint32_t iv);
 };
@@ -350,7 +354,7 @@ KdaVarlenRecurrentDecode<SAVE_INTERMEDIATE, H_TOTAL, V_TILES>::HeadDecay(uint32_
 template<bool SAVE_INTERMEDIATE, uint32_t H_TOTAL, uint32_t V_TILES>
 __aicore__ inline void
 KdaVarlenRecurrentDecode<SAVE_INTERMEDIATE, H_TOTAL, V_TILES>::PrepareGroup(
-    uint32_t head, uint32_t tok0, uint32_t rows, float decay)
+    uint32_t head, uint32_t tok0, uint32_t rows, float decay, bool reused)
 {
     constexpr uint32_t D = config::D;
     constexpr uint32_t C = config::C;
@@ -365,6 +369,15 @@ KdaVarlenRecurrentDecode<SAVE_INTERMEDIATE, H_TOTAL, V_TILES>::PrepareGroup(
         0};
     const uint64_t base = static_cast<uint64_t>(tok0) * H_TOTAL * D
                           + static_cast<uint64_t>(head) * D;
+
+    // These buffers are reused every group, and the caller's recurrence reads
+    // `vbLocal` to its last token, so MTE2 must not refill them until those
+    // reads retire. Without this a sequence past one group reads v rows from
+    // the next group, off by C tokens.
+    if (reused) {
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kda_decode::EVENT_V_MTE2_IN);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kda_decode::EVENT_V_MTE2_IN);
+    }
 
     AscendC::DataCopy(qbLocal, qGm[base], rowParams);
     AscendC::DataCopy(kbLocal, kGm[base], rowParams);
@@ -619,7 +632,8 @@ KdaVarlenRecurrentDecode<SAVE_INTERMEDIATE, H_TOTAL, V_TILES>::RunItem(
         const uint32_t rows = (tok0 + static_cast<int32_t>(C) <= eos)
                                   ? C
                                   : static_cast<uint32_t>(eos - tok0);
-        PrepareGroup(head, static_cast<uint32_t>(tok0), rows, decay);
+        PrepareGroup(head, static_cast<uint32_t>(tok0), rows, decay,
+                     /*reused=*/tok0 > bos);
 
         for (uint32_t r = 0; r < rows; ++r) {
             const int32_t token = tok0 + static_cast<int32_t>(r);
