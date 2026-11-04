@@ -85,3 +85,62 @@ def kda_varlen_recurrent(
         track_state_indices=track_state_indices,
         track_state_lens=track_state_lens,
     )
+
+
+def kda_varlen_chunk(
+    *,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b: torch.Tensor,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float,
+    scale: float,
+    prefill: bool = False,
+    track_state_indices: Optional[torch.Tensor] = None,
+    track_state_lens: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Chunked KDA; returns the output, updates state in place.
+
+    The chunked form of :func:`kda_varlen_recurrent`, computing the same
+    operator over blocks of 64 tokens rather than one token at a time. The
+    interface is that function's, minus ``intermediate_state``, which has no
+    chunked analogue: the recurrence's per-token checkpoints are not
+    materialized here.
+
+    ``chunk_size`` is deliberately absent. It is a compile-time constant of the
+    kernel (64), since the UB map, the workspace stride and the gate-rebase
+    block count all derive from it.
+
+    Requires H == HV, K == V == 128, and **every sequence length a multiple of
+    64**. ``initial_state_source`` must be [slots, H, K, V] with K contiguous
+    (stride(2)==1, stride(3)==128), the same pool layout the recurrent op
+    takes, so the two are interchangeable on one pool.
+
+    ``track_state_indices``/``track_state_lens`` behave as in the recurrence:
+    slot ``track_state_indices[i]`` receives the state of request ``i`` after
+    ``track_state_lens[i]`` of its own tokens, with 0 meaning the initial
+    state.
+    """
+    return torch.ops.sgl_glm53_ascend.kda_varlen_chunk(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=initial_state_source,
+        initial_state_indices=initial_state_indices,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+        scale=scale,
+        prefill=prefill,
+        track_state_indices=track_state_indices,
+        track_state_lens=track_state_lens,
+    )

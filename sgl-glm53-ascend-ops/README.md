@@ -64,4 +64,14 @@ pip install .
 |---|---|
 | `helloworld_kernel` | `csrc/helloworld/helloworld.cpp` |
 | `prepared_recurrent_kernel` | `csrc/kda/prepared_recurrent.cpp` |
+| `kda_varlen_recurrent_kernel` | `csrc/kda/kda_varlen_recurrent*.cpp` |
+| `kda_varlen_chunk_kernel` | `csrc/kda/kda_varlen_chunk*.cpp` |
 | `reduce_kernel` | `csrc/reduce/reduce_sum.cpp` |
+
+`SGL_OPS` is cached at configure time. If a newly added kernel reports
+`Kernel skipped`, the cache holds an explicit list from an earlier configure —
+pass the full list again (or delete `build/CMakeCache.txt`):
+
+```bash
+cmake -B build -G Ninja -DSGL_OPS="helloworld;prepared_recurrent;reduce;kda_varlen_recurrent;kda_varlen_chunk"
+```

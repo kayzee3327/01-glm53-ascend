@@ -112,7 +112,8 @@ set(SGL_OPS "" CACHE STRING
 # ---------------------------------------------------------------------------
 # Kernel definitions — one per independently developed operator
 # ---------------------------------------------------------------------------
-set(_ALL_KERNEL_NAMES helloworld prepared_recurrent kda_varlen_recurrent reduce)
+set(_ALL_KERNEL_NAMES helloworld prepared_recurrent kda_varlen_recurrent
+    kda_varlen_chunk reduce)
 
 set(_SRC_helloworld            csrc/helloworld/helloworld.cpp)
 set(_SRC_prepared_recurrent    csrc/kda/prepared_recurrent.cpp)
@@ -132,6 +133,13 @@ set(_SRC_kda_varlen_recurrent
     csrc/kda/kda_varlen_recurrent_decode_h16.cpp
     csrc/kda/kda_varlen_recurrent_decode_h32.cpp
     csrc/kda/kda_varlen_recurrent_decode_h64.cpp)
+# kda_varlen_chunk is the chunked form of the same operator: the host op plus
+# one MIX kernel (one Cube block and two Vector blocks per (sequence, head)).
+# Two translation units because the host TU includes torch and the device TU
+# cannot.
+set(_SRC_kda_varlen_chunk
+    csrc/kda/kda_varlen_chunk.cpp
+    csrc/kda/kda_varlen_chunk_kernel.cpp)
 set(_SRC_reduce                csrc/reduce/reduce_sum.cpp)
 
 foreach(_NAME IN LISTS _ALL_KERNEL_NAMES)
