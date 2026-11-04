@@ -1,10 +1,16 @@
-from bench_kda_chunk import ATOL, RTOL, Case, clone_state, make_inputs
+"""PyTorch references for the GLM KDA varlen operator, chunked and recurrent.
+
+Imported by ``bench_kda_chunk.py`` for its correctness anchor, so this module
+must not import that one at module scope -- the import that used to be here
+pulled the benchmark in as a second module object and re-ran its device pin.
+``run()`` below does the comparison these two are checked against each other
+with, and takes the benchmark's inputs through a deferred import.
+"""
+
+from typing import Optional, Tuple
+
 import torch
-import torch_npu
-import torch.nn.functional as F
-import triton
-import triton.language as tl
-from typing import Optional, Tuple, TYPE_CHECKING
+import torch_npu  # noqa: F401  registers the NPU device backend
 from einops import rearrange, einsum
 
 def kda_pre_torch(
@@ -304,6 +310,14 @@ def kda_recur_torch(
 
 
 def run():
+    """Check the two references against each other on one shape.
+
+    The benchmark is imported here rather than at module scope: it imports this
+    module for its anchor, so a top-level import either way round would be
+    circular.
+    """
+    from bench_kda_chunk import ATOL, RTOL, Case, clone_state, make_inputs
+
     tokens = 2**10 * 4
     heads = 8
     chunk_size = 64

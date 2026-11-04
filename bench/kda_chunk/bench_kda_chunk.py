@@ -3,8 +3,11 @@
 Target: the Ascend C kernel in the sglang GLM-5.3 plugin, written here from
 scratch rather than wrapped around someone else's.
 
-``ascendc``  the kernel under development. Not implemented yet; the arm is
-             wired up and reports ``-`` until the op appears.
+``ascendc``  the kernel under development, through
+             ``sgl_glm53_ascend_ops.ops.kda_varlen_chunk``. Takes the caller's
+             raw ``[1, T, H, D]`` inputs and fuses the preparation the other
+             two need on the host; chunk size 64 only, since it is a
+             compile-time constant of the kernel.
 ``cann``     CANN 9.2.0's ``ChunkKdaFwd``, via ``ref_ops.cann``.
 ``fla``      flash-linear-attention-npu's, via ``ref_ops.fla_npu``.
 ``torch``    the correctness anchor, left blank to be written. Not a measured
@@ -42,8 +45,11 @@ import torch_npu  # noqa: F401,E402  registers the NPU device backend
 
 from benchmark import (  # noqa: E402
     BenchmarkConfig,
+    BenchmarkResult,
+    ImplementationResult,
     NpuEventMeasurer,
     Reference,
+    ReferenceResult,
     benchmark,
     make_comparator,
 )
@@ -64,6 +70,18 @@ except Exception as exc:  # pragma: no cover - depends on the install
     REF_OPS_ERROR = f"ref_ops is not importable: {exc}"
 else:
     REF_OPS_ERROR = None
+
+# The target. Imported here for the same reason and with the same contract as
+# `ref_ops` above: importing the package is what loads the compiled library, a
+# missing build is a skipped column rather than a dead script, and the order
+# matters -- this import must not be the first thing to touch the aclnn path.
+try:
+    from sgl_glm53_ascend_ops.ops import kda_varlen_chunk  # noqa: E402
+except Exception as exc:  # pragma: no cover - depends on the build
+    kda_varlen_chunk = None
+    ASCENDC_ERROR = f"sgl_glm53_ascend_ops is not importable: {exc}"
+else:
+    ASCENDC_ERROR = None
 
 # Index into the visible set, which the pin above narrows to physical card 4.
 DEVICE = "npu:0"
@@ -96,10 +114,10 @@ RTOL = 2e-2
 ATOL = 2e-4
 comparator = make_comparator(rtol=RTOL, atol=ATOL)
 
-PREFILL_HEADS = (4, 8)  # TP16 / TP8
-PREFILL_TOKENS = (1024, 2048, 4096, 8192, 16384)
+PREFILL_HEADS = (8,)  # TP16 / TP8
+PREFILL_TOKENS = (1024, 2048, 4096,)
 # The operator supports 64 and 128.
-CHUNK_SIZES = (64, 128)
+CHUNK_SIZES = (64,)
 
 CONFIG = BenchmarkConfig(warmup=5, rounds=20, batch_size=5)
 
@@ -376,39 +394,95 @@ def prepare_tnd(inputs: Inputs):
 
 
 def run_ascendc(inputs: Inputs, case: Case):
-    """The sglang GLM-5.3 plugin kernel.
+    """The sglang GLM-5.3 plugin kernel, ``kda_varlen_chunk``.
 
-    Not implemented. When the op lands, dispatch to it here and return
-    (attn_out, final_state); the rest of the script needs no change.
+    No ``prepare_tnd``: this op takes the caller's packed ``[1, T, H, D]``
+    tensors and the raw gate and beta directly, and does the L2 norms, the
+    sigmoids and the bounded gate in its AIV prologue. That is the comparison
+    the benchmark is set up to make -- the preparation is in the timed region
+    for every arm, so fusing it counts.
+
+    Two conversions remain, both of them layout rather than math:
+
+    * ``dt_bias`` back to ``[HV, K]``. The op accepts either, the flat form is
+      what ``Inputs`` carries for the reference arms.
+    * The state pool is cloned. The op updates it in place, where the chunk
+      references return a new tensor, so the arm has to be given a copy or
+      successive timed calls would each start from the previous call's final
+      state. ``clone_state`` keeps the K-contiguous backing the op requires.
+
+    Returned as ``(attn_out, final_state)`` like the other arms: the output
+    squeezed to ``[T, HV, V]``, and the live slots gathered out of the pool as
+    fp32 ``[N, HV, K, V]``.
     """
-    raise NotImplementedError(
-        "Ascend C chunk KDA kernel is not implemented yet"
+    if kda_varlen_chunk is None:
+        raise NotImplementedError(ASCENDC_ERROR)
+    state = clone_state(inputs.state)
+    heads = inputs.q.shape[2]
+    out = kda_varlen_chunk(
+        A_log=inputs.A_log,
+        a=inputs.a,
+        dt_bias=inputs.dt_bias.view(heads, D),
+        q=inputs.q,
+        k=inputs.k,
+        v=inputs.v,
+        b=inputs.b,
+        initial_state_source=state,
+        initial_state_indices=inputs.indices,
+        cu_seqlens=inputs.cu_seqlens,
+        lower_bound=LOWER_BOUND,
+        scale=SCALE,
+        prefill=True,
+        track_state_indices=inputs.track_indices,
+        track_state_lens=inputs.track_lens,
     )
+    return out.squeeze(0), state[inputs.indices.long()].float()
 
 
 def run_torch(inputs: Inputs, case: Case):
-    """The correctness anchor, in the same (attn_out, final_state) shape.
+    """The correctness anchor: ``kda_python.kda_chunk_torch``, on the host.
 
-    Left blank on purpose -- this one is written by hand. Two things about it
-    are decided by how the frame uses it rather than by what it is:
+    A literal transcription of the chunked formulas -- it builds the full
+    ``[BT, BT]`` ``A`` column by column and inverts it by forward substitution,
+    with O(C^2 K) temporaries -- which is affordable because this is never
+    timed. It takes the raw gate and raw beta and does the activation, the
+    sigmoid and the L2 norms itself, so it shares no preparation code with the
+    measured arms; ``prepare_tnd`` is not involved.
 
-    * It is never timed, so it can be a literal transcription of the formulas
-      -- O(C^2 K) temporaries and all -- instead of anything a kernel could
-      run. Being obviously right is the only requirement.
-    * It should accumulate in fp64, which means running on CPU, because the NPU
-      has no fp64. ``torch.testing.assert_close`` wants matching dtypes, so
-      either round the result to the arm's dtype here or upcast at the
-      comparison site in ``bench_one``; the tolerances above were set with the
-      former, where the bf16 rounding alone costs up to ~3.9e-3 relative.
+    Runs on the NPU, in fp32. Not a compromise on either count:
 
-    ``inputs`` carries the raw gate and raw beta, so this has to apply the
-    activation and the sigmoid itself -- ``prepare_tnd`` is one way to get the
-    prepared forms, and ``USE_GATE_IN_KERNEL`` describes what the measured arms
-    do with the gate.
+    * fp32 is what the reference is, by construction rather than by choice of
+      device -- ``kda_chunk_torch`` calls ``.float()`` on q/k/a/b and allocates
+      its accumulator ``torch.float32``, so handing it fp64 would downcast at
+      the first line. Comparing fp32 against fp32 with a different summation
+      order is the question these tolerances were set for.
+    * On device it stays on the same inputs as the arms, bit for bit. A host
+      copy would be the same values, but the anchor is also the only thing
+      standing between a layout bug and a PASS, so there is no reason to move
+      it off the pool the kernel reads.
+
+    ``v`` is passed as fp32 purely for the return dtype: ``kda_chunk_torch``
+    casts its output back to ``v.dtype`` on the way out, and the bf16 round
+    trip would cost up to ~3.9e-3 relative for nothing. The upcast is exact and
+    the function upcasts everything internally anyway, so the arithmetic is
+    unchanged.
+
+    The state pool is cloned for the same reason as in ``run_ascendc``: this
+    reference writes the final state into it in place, and every arm on a row
+    reads the one pool ``make_inputs`` produced.
     """
-    raise NotImplementedError(
-        "chunk KDA pytorch reference is not implemented yet"
-    )
+    from kda_python import kda_chunk_torch
+
+    kwargs = inputs.chunk_kwargs()
+    # `chunk_kwargs` reads `chunk_size` off `Inputs`, which `make_inputs`
+    # populates only under `chunk=True`. The benchmark builds its inputs
+    # without it, so it comes from the case instead -- one source either way.
+    kwargs["chunk_size"] = case.chunk_size
+    kwargs["initial_state_source"] = clone_state(inputs.state)
+    kwargs["v"] = inputs.v.float()
+
+    out = kda_chunk_torch(**kwargs)
+    return out.squeeze(0), kwargs["initial_state_source"][inputs.indices.long()]
 
 
 def run_cann(inputs: Inputs, case: Case):
@@ -459,8 +533,13 @@ TARGET = "ascendc"
 # What to say when an arm cannot run, instead of a traceback.
 UNAVAILABLE_MARKERS = (
     "not implemented",
-    # `ref_ops`' own message when a vendor package was never built.
-    "run `python -m ref_ops.build` first",
+    # `ref_ops`' own message when a vendor package was never built. Matched on
+    # the module prefix rather than on the build instruction that follows it,
+    # which has already changed once and took the whole run down with it when
+    # it did -- a missing optional arm has to stay a skipped column.
+    "ref_ops.cann:",
+    "ref_ops.fla_npu:",
+    "is not installed",
 )
 
 
@@ -478,9 +557,18 @@ def unsupported_shape(name: str, case: Case) -> Optional[str]:
     with ``chunkSize only supports 64`` from the workspace call. So it covers
     the C64 rows and reports ``-`` on the C128 ones, rather than being skipped
     outright for a limit that applies to half the table. ``cann`` runs both.
+
+    ``ascendc`` has the same restriction for a different reason: 64 is a
+    compile-time constant of the kernel, not an argument -- the UB map, the
+    workspace stride and the gate-rebase block count all derive from it, so the
+    op takes no ``chunk_size`` at all. Reporting it as unsupported rather than
+    silently measuring a C64 kernel in the C128 rows is the point; a row that
+    compared C64 against the references' C128 would read as a speedup.
     """
     if name == "fla" and case.chunk_size != 64:
         return "fla's KDA chunk path supports chunk_size=64 only"
+    if name == "ascendc" and case.chunk_size != 64:
+        return "the Ascend C kernel's chunk size is fixed at 64"
     return None
 
 
@@ -518,14 +606,20 @@ def bench_one(case: Case, target_name: str, reference_names: list[str]):
     That leaves the framework doing what it is good at -- warmup, repeats and
     paired statistics -- and keeps the measurement meaningful even when the
     target is the only live arm.
+
+    The target can also be the arm that does not cover the row -- ``ascendc``
+    is C64-only while the table has C128 rows. Such a row still measures every
+    reference that covers it, with the first of them standing in as the
+    denominator, so the C128 rows keep reporting the bar rather than going
+    blank. The target's own cells read ``-`` there.
     """
     inputs = make_inputs(case)
     try:
         # `.cpu()` as well as `.float()`: the arms are compared on the host
         # below, and `assert_close` treats device as an attribute to match, so
         # an anchor left on the NPU fails every comparison on the device alone
-        # -- including against a bit-identical tensor. A CPU anchor is also what
-        # the docstring above asks for, since fp64 has no NPU implementation.
+        # -- including against a bit-identical tensor. The anchor is computed
+        # on the NPU; only the comparison happens here.
         expected = tuple(t.float().cpu() for t in run_torch(inputs, case))
     except NotImplementedError:
         # No anchor yet: measure, and report validity as unknown rather than
@@ -539,9 +633,10 @@ def bench_one(case: Case, target_name: str, reference_names: list[str]):
     live = [
         name for name in reference_names if unsupported_shape(name, case) is None
     ]
+    target_covers = unsupported_shape(target_name, case) is None
 
     validity: dict[str, Optional[bool]] = {}
-    for name in [target_name, *live]:
+    for name in ([target_name] if target_covers else []) + live:
         if expected is None:
             validity[name] = None
             continue
@@ -551,6 +646,35 @@ def bench_one(case: Case, target_name: str, reference_names: list[str]):
             validity[name] = True
         except AssertionError:
             validity[name] = False
+
+    if not target_covers:
+        # Nothing to time the references against, so the first of them becomes
+        # the denominator for this row only. Assembled directly rather than
+        # through `benchmark`, which requires a target.
+        if not live:
+            empty = BenchmarkResult(
+                target=ImplementationResult(name="target"), references=[],
+            )
+            return empty, validity
+        stand_in, *rest = live
+        result = benchmark(
+            target=functools.partial(ARMS[stand_in], inputs, case),
+            references=[
+                Reference(name=name, fn=functools.partial(ARMS[name], inputs, case))
+                for name in rest
+            ],
+            comparator=lambda actual, expected_: None,
+            measurer=NpuEventMeasurer(),
+            config=CONFIG,
+        )
+        # Re-label: the stand-in's numbers belong in its own column, and the
+        # target column is empty on this row.
+        result.references.insert(
+            0,
+            ReferenceResult(name=stand_in, measurement=result.target.measurement),
+        )
+        result.target = ImplementationResult(name="target")
+        return result, validity
 
     result = benchmark(
         target=functools.partial(ARMS[target_name], inputs, case),
@@ -597,6 +721,16 @@ def print_table(rows, target_name: str, reference_names: list[str]):
             ok(validity, target_name),
         ]
         by_name = {ref.name: ref for ref in result.references}
+        # The speedup denominator. Normally the target; on a row the target
+        # does not cover, `bench_one` promoted the first reference instead, so
+        # the column reads against that one and its own `vs` cell is 1.00x.
+        denominator = target
+        if denominator is None:
+            for name in reference_names:
+                ref = by_name.get(name)
+                if ref is not None and ref.measurement is not None:
+                    denominator = ref.measurement
+                    break
         for name in reference_names:
             ref = by_name.get(name)
             measurement = ref.measurement if ref else None
@@ -605,8 +739,8 @@ def print_table(rows, target_name: str, reference_names: list[str]):
                 continue
             row.append(f"{measurement.median_ms:.4f}")
             row.append(
-                f"{measurement.median_ms / target.median_ms:.2f}x"
-                if target and target.median_ms > 0 else "-"
+                f"{measurement.median_ms / denominator.median_ms:.2f}x"
+                if denominator and denominator.median_ms > 0 else "-"
             )
             row.append(ok(validity, name))
         table.append(row)
@@ -632,10 +766,13 @@ def print_table(rows, target_name: str, reference_names: list[str]):
         ("MAD", "median absolute deviation of that latency"),
         ("<arm> ok", "agrees with `run_torch` at the tolerance above;\n"
                      "'-' means there is no anchor to check against yet"),
-        ("vs <arm>", "median(arm) / median(target), >1 means target is faster"),
+        ("vs <arm>", "median(arm) / median(target), >1 means target is faster;\n"
+                     "on a row the target does not cover, quoted against the\n"
+                     "first reference that does, whose own cell reads 1.00x"),
     ]
     arms = [
-        ("ascendc", "the sglang GLM-5.3 plugin kernel, written here"),
+        ("ascendc", "the sglang GLM-5.3 plugin kernel, written here;\n"
+                    "chunk size fixed at 64, so '-' on the C128 rows"),
         ("cann", "CANN 9.2.0 ChunkKdaFwd, via ref_ops.cann"),
         ("fla", "flash-linear-attention-npu, via ref_ops.fla_npu;\n"
                 "chunk_size=64 only, so '-' on the C128 rows"),
