@@ -1,25 +1,30 @@
 """Correctness and latency for the chunked KDA prefill forward.
 
-Three kernels compute the same thing, and this script compares them on the
-shapes GLM-5.3 prefill actually runs:
+Target: the Ascend C kernel in the sglang GLM-5.3 plugin, written here from
+scratch rather than wrapped around someone else's.
 
-``cann``     the official ``ChunkKdaFwd`` from CANN 9.2.0's ops-transformer.
-             The installed toolkit here is 9.0.0, which does not ship this
-             operator at all, so it is built from source as a custom op
-             package -- see ``build_cann_op.py``, which owns the build and is
-             also runnable on its own.
-``triton``   ``triton_kda_chunk.py``, written for this comparison.
-``fla``      ``chunk_kda_fwd`` from flash-linear-attention-npu (Tianjin
-             University), installed as a wheel plus a run package. Supports
-             ``chunk_size=64`` only, so the C128 rows report ``-``.
-``ascendc``  the kernel in the sglang GLM-5.3 plugin. Not implemented yet; the
-             arm is wired up and reports ``-`` until the op appears.
+``ascendc``  the kernel under development. Not implemented yet; the arm is
+             wired up and reports ``-`` until the op appears.
+``cann``     CANN 9.2.0's ``ChunkKdaFwd``, via ``ref_ops.cann``.
+``fla``      flash-linear-attention-npu's, via ``ref_ops.fla_npu``.
+``torch``    the correctness anchor, left blank to be written. Not a measured
+             arm: it validates, it is never timed, and it is free to be as slow
+             and as literal as it needs to be.
 
-The target is whichever arm you are working on -- ``ascendc``, so speedups read
-as "ours vs theirs" once it exists. With no Ascend C op present the script falls
-back to measuring ``triton`` as the target so the other comparisons still run.
+The two outside arms come from the ``ref_ops`` package, which exists so they can
+load in one process: both upstreams otherwise claim the op type ``ChunkKdaFwd``,
+CANN's launcher registry is keyed by that string, and the loser used to segfault.
+``ref_ops`` resolves that by shipping *renamed* copies of the CANN-side ops, so
+no vendor selection or re-exec is needed here -- importing it is the whole
+mechanism. See ``ref_ops/AGENTS.md``.
 
-Correctness is checked against ``reference.py``, torch fp64 ref.
+Inputs follow ``bench_kda_varlen_recurrent.py``'s ``make_case`` exactly: same
+shapes, same dtypes, same distributions, same native state-pool layout. The two
+benchmarks measure the two halves of the same deployed prefill, so a shape that
+disagreed between them would make the comparison meaningless. The chunk
+operators want TND and pre-normalized q/k, which ``prepare_tnd`` derives inside
+each arm rather than in ``make_inputs`` -- see its docstring for why that
+belongs in the timed region.
 """
 
 from __future__ import annotations
@@ -27,64 +32,12 @@ from __future__ import annotations
 import functools
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Callable, Optional
 
 # Default npu:4
 os.environ.setdefault("ASCEND_RT_VISIBLE_DEVICES", "4")
 
-# --- vendor selection, before anything touches CANN ----------------------
-#
-# `cann` and `fla` cannot both run in one process. Both vendor packages
-# register the *same* op type, `ChunkKdaFwd`, and CANN's launcher registry is
-# keyed by that name, so the second registration loses: `cann` segfaults, or
-# `fla` raises "ADD_TO_LAUNCHER_LIST_AICORE ChunkKdaFwd failed", depending on
-# which resolved first. Path ordering does not help -- there is one slot for
-# that name and two packages claiming it.
-#
-# So the arm is chosen per process by `KDA_CHUNK_VENDOR`, and `main` re-runs
-# this script once per vendor so a single command still measures both. The
-# selection has to happen here, at import time: the dlsym handler list is built
-# on the first aclnn call and cached in a function-local static for the life of
-# the process, and `fla_npu`'s own .pth prepends its vendor at interpreter
-# start, before any user code runs.
-VENDOR_ENV = "KDA_CHUNK_VENDOR"
-VENDORS = ("cann", "fla")
-
-_CANN_VENDOR_DIRS = (
-    "/usr/local/Ascend/cann-9.0.0/opp/vendors/glm53chunk_transformer",
-    "/usr/local/Ascend/cann-9.0.0/opp/vendors/glm53recurrent_transformer",
-)
-_FLA_VENDOR_DIR = Path(
-    "/data/wangkaize/.vsglang/lib/python3.11/site-packages/fla_npu"
-    "/opp/vendors/fla_npu_transformer"
-)
-
-
-def _select_vendor(name: str) -> None:
-    """Point the aclnn dlsym search at exactly one of the two packages.
-
-    Setting `ASCEND_CUSTOM_OPP_PATH` explicitly rather than appending, because
-    the point is to make the *other* package unreachable -- `cann_op.available`
-    scans `opp/vendors` only when this variable is unset, and would otherwise
-    find and expose both.
-    """
-    if name == "cann":
-        # fla_npu's .pth would re-add its vendor at every interpreter start.
-        os.environ["FLA_NPU_DISABLE_PTH"] = "1"
-        os.environ["ASCEND_CUSTOM_OPP_PATH"] = os.pathsep.join(_CANN_VENDOR_DIRS)
-    else:
-        os.environ["ASCEND_CUSTOM_OPP_PATH"] = os.pathsep.join(
-            [str(_FLA_VENDOR_DIR), str(_FLA_VENDOR_DIR / "op_api" / "lib")]
-        )
-
-
-VENDOR = os.environ.get(VENDOR_ENV, VENDORS[0])
-if VENDOR not in VENDORS:
-    raise SystemExit(f"{VENDOR_ENV} must be one of {VENDORS}, got {VENDOR!r}")
-_select_vendor(VENDOR)
-
-import torch  # noqa: E402  must follow the device pin and vendor selection
+import torch  # noqa: E402  must follow the device pin
 import torch_npu  # noqa: F401,E402  registers the NPU device backend
 
 from benchmark import (  # noqa: E402
@@ -95,8 +48,22 @@ from benchmark import (  # noqa: E402
     make_comparator,
 )
 
-from reference import chunk_kda_reference  # noqa: E402
-from triton_kda_chunk import chunk_kda_triton  # noqa: E402
+# Imported at module scope, and deliberately not inside the arms: `ref_ops`
+# builds the aclnn dlsym search path, and `GetCustOpApiHandlers` caches that
+# path in a function-local static on the *first* operator launch in the process.
+# Whatever is on it at that moment is all the process will ever search, so an
+# import deferred until after the target arm has run would leave both reference
+# vendors unreachable for the rest of the run.
+#
+# A failure here is a skipped column, not a dead script -- the target does not
+# need this package -- so the reason is kept and reported by `arm_status`.
+try:
+    from ref_ops import cann as ref_cann, fla_npu as ref_fla  # noqa: E402
+except Exception as exc:  # pragma: no cover - depends on the install
+    ref_cann = ref_fla = None
+    REF_OPS_ERROR = f"ref_ops is not importable: {exc}"
+else:
+    REF_OPS_ERROR = None
 
 # Index into the visible set, which the pin above narrows to physical card 4.
 DEVICE = "npu:0"
@@ -107,18 +74,24 @@ LOWER_BOUND = -5.0
 SAFE_GATE = True
 USE_GATE_IN_KERNEL = True
 
-# bf16 inputs accumulated in fp32, against a reference that accumulates in fp64.
+# bf16 inputs accumulated in fp32, against a reference expected to accumulate
+# in fp64.
 #
-# Which of the two bounds actually binds, measured at H4 T1024 C64 rather than
-# assumed: `|attn_out|` runs ~4e-5 mean (median 2.2e-5, max 1.4e-3), so 97.8% of
-# its elements sit under `atol` and every element is below the `atol/rtol`
-# crossover at 1e-2. For `attn_out` it is therefore `atol` that decides, not
-# `rtol`. `final_state` is the larger tensor (mean 8.4e-4, max 1.9e-2) and only
-# 29% of it falls under `atol`, so that is where `rtol` does the work.
+# Which of the two bounds actually binds was measured on these inputs at H4
+# T1024 C64: `|attn_out|` runs ~5e-4 mean with a ~1.6e-2 max, so most of it sits
+# under `atol` and `atol` is what decides there. `final_state` is larger (mean
+# ~5e-3) and is where `rtol` does the work.
 #
-# The pair is still not vacuous -- zeroing or halving `attn_out`, or zeroing
-# `final_state`, each produce FAIL -- but a regime that only perturbed the small
-# bulk of `attn_out` would need `atol` tightened to be caught.
+# The size of the disagreement these have to admit is measured, not guessed:
+# `cann` and `fla` on identical inputs differ by ~1 bf16 ulp, and `cann` against
+# the deployed Triton recurrence in `bench_kda_varlen_recurrent.py` differs by
+# 6.1e-5 on `attn_out` and 4.4e-4 on `final_state` -- a different summation
+# order over the same recurrence, not a different answer. `atol` has to clear
+# that and still be well under the 5e-4 signal, which is what sets it here.
+#
+# The pair is not vacuous -- zeroing or halving `attn_out`, or zeroing
+# `final_state`, each produced FAIL -- but a regime that only perturbed the
+# small bulk of `attn_out` would need `atol` tightened to be caught.
 RTOL = 2e-2
 ATOL = 2e-4
 comparator = make_comparator(rtol=RTOL, atol=ATOL)
@@ -127,11 +100,6 @@ PREFILL_HEADS = (4, 8)  # TP16 / TP8
 PREFILL_TOKENS = (1024, 2048, 4096, 8192, 16384)
 # The operator supports 64 and 128.
 CHUNK_SIZES = (64, 128)
-
-# The arm speedups are quoted against, or None to pick it automatically:
-# `ascendc` when that kernel exists, else `triton` so the CANN comparison still
-# has a baseline.
-TARGET: Optional[str] = None
 
 CONFIG = BenchmarkConfig(warmup=5, rounds=20, batch_size=5)
 
@@ -151,120 +119,260 @@ class Case:
 
 @dataclass
 class Inputs:
+    """One invocation's tensors, in the recurrence benchmark's layout.
+
+    ``q``/``k``/``v``/``a`` are ``[1, T, H, D]`` and ``b`` is ``[1, T, H]``,
+    which is the caller's packed-prefill shape and the shape
+    ``bench_kda_varlen_recurrent.py`` measures. ``a`` is the *raw* gate and
+    ``b`` the *raw* beta: the activation and the sigmoid happen downstream, in
+    the kernel or in ``prepare_tnd``, never here.
+
+    ``dt_bias`` is flat ``[HV*K]``: the form both reference arms require, and
+    the form the Triton recurrence indexes as ``i_hv * K + o_k``.
+
+    The last three are the reference's optional prefill outputs and are ``None``
+    in the measured regime: the chunk operators have no equivalent, and
+    ``intermediate`` being absent is what makes the recurrence write its final
+    state to the pool at all. ``make_inputs`` builds them on request, for
+    checking a chunked kernel's state at the chunk boundaries.
+    """
+
     q: torch.Tensor
     k: torch.Tensor
     v: torch.Tensor
-    g: torch.Tensor
-    beta: torch.Tensor
+    a: torch.Tensor
+    b: torch.Tensor
     A_log: torch.Tensor
     dt_bias: torch.Tensor
+    state: torch.Tensor
+    indices: torch.Tensor
     cu_seqlens: torch.Tensor
+    intermediate: Optional[torch.Tensor] = None
+    track_indices: Optional[torch.Tensor] = None
+    track_lens: Optional[torch.Tensor] = None
+    chunk_size: Optional[int] = None
 
-    def as_kwargs(self) -> dict:
+    def to(self, device) -> "Inputs":
+        """The same tensors on ``device``, for the fp64 anchor on the host.
+
+        The pool moves through its transpose because a plain ``.to`` returns it
+        contiguous, dropping the ``[V, K]`` backing ``native_state`` builds.
+        """
+        def move(name):
+            t = getattr(self, name)
+            if t is None:
+                return None
+            # Same trailing layout one axis deeper for `intermediate`.
+            if name in ("state", "intermediate"):
+                return t.transpose(-1, -2).to(device).transpose(-1, -2)
+            return t.to(device)
+
+        return Inputs(**{n: move(n) for n in self.__dataclass_fields__})
+
+    def recurrence_kwargs(self) -> dict:
+        """These tensors as ``kda_python.kda_recur_torch``'s keyword arguments.
+
+        ``state``/``indices`` take their deployed names, ``dt_bias`` becomes the
+        ``[HV, K]`` view, and the scalars come from the module constants.
+
+        The three optionals pass through as built. All ``None`` is the measured
+        regime, and is also the only setting under which the final state reaches
+        the pool -- the recurrence takes that branch on ``intermediate is
+        None``, and upstream rejects tracking unless ``prefill`` is set.
+
+        The pool is written in place, so clone it first if you need it intact.
+        """
+        heads = self.q.shape[2]
         return dict(
-            q=self.q, k=self.k, v=self.v, g=self.g, beta=self.beta,
-            A_log=self.A_log, dt_bias=self.dt_bias, cu_seqlens=self.cu_seqlens,
-            scale=SCALE, safe_gate=SAFE_GATE, lower_bound=LOWER_BOUND,
-            use_gate_in_kernel=USE_GATE_IN_KERNEL,
+            A_log=self.A_log,
+            a=self.a,
+            dt_bias=self.dt_bias.view(heads, D),
+            q=self.q,
+            k=self.k,
+            v=self.v,
+            b=self.b,
+            initial_state_source=self.state,
+            initial_state_indices=self.indices,
+            cu_seqlens=self.cu_seqlens,
+            lower_bound=LOWER_BOUND,
+            scale=SCALE,
+            intermediate_state=self.intermediate,
+            prefill=True,
+            track_state_indices=self.track_indices,
+            track_state_lens=self.track_lens,
         )
 
+    def chunk_kwargs(self) -> dict:
+        heads = self.q.shape[2]
+        return dict(
+            A_log=self.A_log,
+            a=self.a,
+            dt_bias=self.dt_bias.view(heads, D),
+            q=self.q,
+            k=self.k,
+            v=self.v,
+            b=self.b,
+            initial_state_source=self.state,
+            initial_state_indices=self.indices,
+            cu_seqlens=self.cu_seqlens,
+            lower_bound=LOWER_BOUND,
+            scale=SCALE,
+            prefill=True,
+            track_state_indices=self.track_indices,
+            track_state_lens=self.track_lens,
+            chunk_size=self.chunk_size
+        )
 
-def make_inputs(case: Case, seed: int = 20261026) -> Inputs:
-    """TND varlen inputs for one packed sequence, on device.
+def native_state(slots: int, heads: int) -> torch.Tensor:
+    """The only state layout that reaches the kernel in production.
 
-    Scaled the way the pytest suite in ops-transformer scales them: small q/k/v
-    and a gate centred near -0.5, which is what the deployed activation sees.
+    Allocated contiguous as [slots,H,V,K] and viewed as [slots,H,K,V], which
+    gives stride(2)=1, stride(3)=128. Copied from the recurrence benchmark,
+    where the stride is load-bearing: a plain contiguous pool silently selects a
+    different Triton specialization there. The chunk operators take their
+    initial state as a normal contiguous tensor and do not care, but the pool is
+    built the same way so both benchmarks start from the same bytes.
     """
-    gen = torch.Generator(device="cpu").manual_seed(seed)
+    pool = torch.randn(slots, heads, D, D, device=DEVICE) * 0.1
+    return pool.transpose(-1, -2)
+
+
+def native_intermediate(slots: int, steps: int, heads: int) -> torch.Tensor:
+    """The per-token checkpoint buffer as the backend hands it over.
+
+    [slots, steps, HV, K, V] with stride(3)=1 -- the same K-contiguous
+    orientation as the state pool, one axis deeper. Noise rather than zeros so a
+    step the kernel fails to write shows as a mismatch instead of matching an
+    untouched zero.
+    """
+    pool = torch.randn(slots, steps, heads, D, D, device=DEVICE) * 0.1
+    return pool.transpose(-1, -2)
+
+
+def clone_state(state: torch.Tensor) -> torch.Tensor:
+    """A copy of the pool that keeps its ``[V, K]`` backing.
+
+    A plain ``.clone()`` makes the view contiguous, which in the recurrence
+    benchmark silently selects a different Triton specialization. Needed here
+    for a different reason: the recurrence reference writes the final state into
+    the pool in place, and every arm on a row reads the one pool ``make_inputs``
+    produced, so an arm that mutates it has to be given a copy.
+    """
+    return state.transpose(-1, -2).clone().transpose(-1, -2)
+
+
+def make_inputs(
+    case: Case,
+    seed: int = 20261026,
+    checkpoints: bool = False,
+    track_len: Optional[int] = None,
+    chunk: bool = False
+) -> Inputs:
+    """Inputs for one packed single-sequence prefill, on device.
+
+    Shapes, dtypes and distributions are ``make_case`` from
+    ``bench_kda_varlen_recurrent.py``, down to the 0.2 and 0.1 scale factors and
+    the padding row at slot zero. That file measures the recurrence this kernel
+    replaces, so the two have to agree on their inputs or the comparison between
+    them says nothing. The only thing added here is ``chunk_size``, which lives
+    on ``Case``.
+
+    Both optional arguments default off, which is the measured regime -- they
+    exist for debugging a chunked kernel against the recurrence at intermediate
+    points, where "the final states agree" is not the question:
+
+    ``checkpoints``  every per-token state, as [1, T, HV, K, V]. Suppresses the
+                     final write to the pool, so ``final_state`` has to be read
+                     out of the last step instead.
+    ``track_len``    one state, after this many tokens, into pool slot 2. A
+                     chunk boundary is the useful value. Mutually exclusive
+                     with ``checkpoints`` upstream.
+    ``chunk``        whether to use chunk kda
+    """
+    torch.manual_seed(seed)
     t, h = case.tokens, case.heads
+    if checkpoints and track_len is not None:
+        raise ValueError("prefix tracking and per-token checkpoints are exclusive")
 
-    def rand(*shape, scale=0.05):
-        return (torch.randn(*shape, generator=gen) * scale).to(torch.bfloat16).npu()
-
+    tensors = {
+        name: (torch.randn(1, t, h, D, device=DEVICE) * 0.2).bfloat16()
+        for name in ("q", "k", "v", "a")
+    }
+    tracking = track_len is not None
     return Inputs(
-        q=rand(t, h, D),
-        k=rand(t, h, D),
-        v=rand(t, h, D),
-        g=(torch.randn(t, h, D, generator=gen) * 0.02 - 0.5).float().npu(),
-        beta=torch.sigmoid(torch.randn(t, h, generator=gen)).to(torch.bfloat16).npu(),
-        A_log=torch.linspace(-0.5, 0.5, h, dtype=torch.float32).npu(),
-        dt_bias=torch.linspace(-0.1, 0.1, h * D, dtype=torch.float32).npu(),
-        cu_seqlens=torch.tensor([0, t], dtype=torch.int64).npu(),
+        **tensors,
+        b=torch.randn(1, t, h, device=DEVICE).bfloat16(),
+        A_log=torch.randn(h, device=DEVICE) * 0.1,
+        dt_bias=torch.randn(h * D, device=DEVICE) * 0.1,
+        # Slot zero is the padding row and is never written. One sequence, so
+        # one live slot -- plus a second for the tracked checkpoint, which has
+        # to be distinct from every live source slot.
+        state=native_state(3 if tracking else 2, h),
+        indices=torch.ones(1, dtype=torch.int32, device=DEVICE),
+        cu_seqlens=torch.tensor([0, t], dtype=torch.int32, device=DEVICE),
+        intermediate=native_intermediate(1, t, h) if checkpoints else None,
+        track_indices=(
+            torch.full((1,), 2, dtype=torch.int32, device=DEVICE) if tracking else None
+        ),
+        track_lens=(
+            torch.full((1,), track_len, dtype=torch.int32, device=DEVICE)
+            if tracking
+            else None
+        ),
+        chunk_size=case.chunk_size if chunk else None
     )
 
 
-# --- the three arms -------------------------------------------------------
+# --- the arms, and the anchor they are checked against --------------------
 #
-# Each returns (attn_out, final_state): attn_out as [T, HV, V] in the input
-# dtype, final_state as fp32 [N, HV, K, V]. Anything an arm computes beyond
-# those two is ignored, so an arm that also emits backward intermediates is not
-# penalised for it in the comparison -- but it does pay for them in latency,
-# which is noted in the table legend.
+# Every arm returns (attn_out, final_state): attn_out as [T, HV, V] in the input
+# dtype, final_state as fp32 [N, HV, K, V]. Verified for both reference arms --
+# they return exactly that, and `final_state` comes back in the same K/V
+# orientation as the state pool, not transposed.
 
 
-def run_triton(inputs: Inputs, case: Case):
-    return chunk_kda_triton(chunk_size=case.chunk_size, **inputs.as_kwargs())
+def prepare_tnd(inputs: Inputs):
+    """``(q, k, v, g, beta, initial_state)`` as the chunk operators want them.
 
+    Two conversions, both of which the deployed prefill also performs:
 
-def run_cann(inputs: Inputs, case: Case):
-    """The official kernel, via the built custom op package."""
-    from cann_op import chunk_kda_fwd_cann
+    * **Squeeze to TND.** The operators take ``[T, H, D]`` for a packed
+      sequence. Passing a ``[1, T, H, D]`` tensor as BSND would read ``T`` as
+      the batch -- the same trap the recurrence benchmark records for
+      ``recurrent_kda``.
+    * **L2-normalize q/k and sigmoid beta, in fp32.** This is what
+      ``_prepare_inputs`` does upstream before the recurrence, and it is not
+      optional here: the ``ref_ops`` CANN bridge exposes no
+      ``use_qk_l2norm_in_kernel`` flag, and ``fla``'s in-kernel path refuses
+      every chunk size but 64. Doing it on the host is therefore the only form
+      both arms can be measured in, and the only form in which they are
+      measuring the same thing.
 
-    return chunk_kda_fwd_cann(chunk_size=case.chunk_size, **inputs.as_kwargs())
+    The gate stays raw: ``A_log``, ``dt_bias`` and the bounded sigmoid are
+    applied inside the kernel under ``use_gate_in_kernel``, which is how the
+    deployment runs it.
 
-
-def run_fla(inputs: Inputs, case: Case):
-    """flash-linear-attention-npu's ``chunk_kda_fwd``.
-
-    Reached through the installed wheel, so there is no build step here and no
-    loader like ``cann_op.py`` -- see ``README.md`` for the install.
-
-    Two details of the call, both the wrapper's rather than the kernel's:
-
-    * ``cu_seqlens`` is passed as a host list. The wrapper guards on
-      ``if cu_seqlens and not chunk_indices``, which calls ``bool()`` on a
-      tensor and raises "Boolean value of Tensor ... is ambiguous"; a list
-      takes the same path the op wants and derives the canonical
-      ``chunk_indices`` from it. Upstream's own
-      ``npu_chunk_gated_delta_rule_fwd_prepare`` converts tensors for exactly
-      this reason, so this is a missed call site, not an interface choice.
-    * The return is a 12-tuple of forward and backward intermediates; this
-      bench reads only the first two, matching the other arms. The optional
-      backward exports are left unrequested, but ``gk``/``Aqk``/``Akk`` are
-      computed regardless, the same way the CANN arm pays for its mandatory
-      outputs.
-
-    ``beta`` is already sigmoid-activated by ``make_inputs`` and q/k are not
-    L2-normalized, so the in-kernel switches for both stay off -- which is also
-    what keeps this on the op's plain path: turning either on would require
-    ``chunk_size=64`` *and* bf16 *and* K=V=128 together.
+    Called inside each arm, not hoisted into ``make_inputs``, because the
+    preparation is work the deployed path does per call -- so it belongs in the
+    timed region of any arm that needs it, and the target is free to fuse it
+    and be credited for that.
     """
-    # Imported here rather than at module scope: under `KDA_CHUNK_VENDOR=cann`
-    # this package's operators are deliberately off the search path, and
-    # importing it anyway warns at length about an OPP it cannot reach.
-    from fla_npu.ops.ascendc import chunk_kda_fwd as fla_chunk_kda_fwd
-
-    kwargs = inputs.as_kwargs()
-    cu_seqlens = [int(x) for x in kwargs["cu_seqlens"].cpu().tolist()]
-    attn_out, final_state, *_ = fla_chunk_kda_fwd(
-        kwargs["q"],
-        kwargs["k"],
-        kwargs["v"],
-        kwargs["g"],
-        kwargs["beta"],
-        kwargs["scale"],
-        case.chunk_size,
-        layout="TND",
-        cu_seqlens=cu_seqlens,
-        A_log=kwargs["A_log"],
-        dt_bias=kwargs["dt_bias"],
-        use_gate_in_kernel=kwargs["use_gate_in_kernel"],
-        safe_gate=kwargs["safe_gate"],
-        lower_bound=kwargs["lower_bound"],
-        output_final_state=True,
-        state_v_first=False,
+    q, k = inputs.q.float(), inputs.k.float()
+    q = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6)
+    k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+    return (
+        q.bfloat16().squeeze(0),
+        k.bfloat16().squeeze(0),
+        inputs.v.squeeze(0),
+        inputs.a.squeeze(0),
+        torch.sigmoid(inputs.b.float()).squeeze(0),
+        # Gather the live slots into the [N, HV, K, V] contiguous fp32 tensor
+        # the operators take. The pool itself is a strided view and is not
+        # written by these arms -- the chunk ops return the final state rather
+        # than updating in place, which is the other half of why this benchmark
+        # and the recurrence one cannot share a single call convention.
+        inputs.state[inputs.indices.long()].contiguous(),
     )
-    return attn_out, final_state
 
 
 def run_ascendc(inputs: Inputs, case: Case):
@@ -278,58 +386,82 @@ def run_ascendc(inputs: Inputs, case: Case):
     )
 
 
-def run_reference(inputs: Inputs, case: Case):
-    """The fp64 anchor. Runs on CPU, because the NPU has no fp64.
+def run_torch(inputs: Inputs, case: Case):
+    """The correctness anchor, in the same (attn_out, final_state) shape.
 
-    fp64 describes the *accumulation*, not the result that comes back:
-    ``reference.py`` rounds ``attn_out`` to the input dtype before returning, so
-    the anchor arrives in bf16 and the rounding alone costs up to ~3.9e-3
-    relative (measured at H4 T1024), about a fifth of the ``rtol`` budget.
-    ``final_state`` is unaffected -- it stays fp32.
+    Left blank on purpose -- this one is written by hand. Two things about it
+    are decided by how the frame uses it rather than by what it is:
 
-    Kept rather than fixed, because ``torch.testing.assert_close`` requires
-    matching dtypes, so returning fp64 here would mean every arm's output had to
-    be upcast at the comparison site. The budget it eats is accounted for in the
-    tolerances above.
+    * It is never timed, so it can be a literal transcription of the formulas
+      -- O(C^2 K) temporaries and all -- instead of anything a kernel could
+      run. Being obviously right is the only requirement.
+    * It should accumulate in fp64, which means running on CPU, because the NPU
+      has no fp64. ``torch.testing.assert_close`` wants matching dtypes, so
+      either round the result to the arm's dtype here or upcast at the
+      comparison site in ``bench_one``; the tolerances above were set with the
+      former, where the bf16 rounding alone costs up to ~3.9e-3 relative.
+
+    ``inputs`` carries the raw gate and raw beta, so this has to apply the
+    activation and the sigmoid itself -- ``prepare_tnd`` is one way to get the
+    prepared forms, and ``USE_GATE_IN_KERNEL`` describes what the measured arms
+    do with the gate.
     """
-    kwargs = {
-        key: value.cpu() if isinstance(value, torch.Tensor) else value
-        for key, value in inputs.as_kwargs().items()
-    }
-    return chunk_kda_reference(
-        chunk_size=case.chunk_size, dtype=torch.float64, **kwargs
+    raise NotImplementedError(
+        "chunk KDA pytorch reference is not implemented yet"
     )
+
+
+def run_cann(inputs: Inputs, case: Case):
+    """CANN 9.2.0's ``ChunkKdaFwd``, through ``ref_ops``' renamed copy."""
+    if ref_cann is None:
+        raise NotImplementedError(REF_OPS_ERROR)
+    q, k, v, g, beta, initial_state = prepare_tnd(inputs)
+    return ref_cann.chunk_kda(
+        q, k, v, g, beta,
+        scale=SCALE, chunk_size=case.chunk_size, cu_seqlens=inputs.cu_seqlens,
+        A_log=inputs.A_log, dt_bias=inputs.dt_bias,
+        initial_state=initial_state, safe_gate=SAFE_GATE,
+        lower_bound=LOWER_BOUND, use_gate_in_kernel=USE_GATE_IN_KERNEL,
+    )
+
+
+def run_fla(inputs: Inputs, case: Case):
+    """flash-linear-attention-npu's ``chunk_kda_fwd``.
+
+    Trimmed to ``(attn_out, final_state)``: upstream also returns the
+    ``gk``/``Aqk``/``Akk`` intermediates, which are mandatory outputs and are
+    computed either way, so dropping the references to them here changes what
+    is read, not what is paid for.
+    """
+    if ref_fla is None:
+        raise NotImplementedError(REF_OPS_ERROR)
+    q, k, v, g, beta, initial_state = prepare_tnd(inputs)
+    out = ref_fla.chunk_kda(
+        q, k, v, g, beta, SCALE, case.chunk_size,
+        layout="TND", cu_seqlens=inputs.cu_seqlens, output_final_state=True,
+        initial_state=initial_state, safe_gate=SAFE_GATE,
+        lower_bound=LOWER_BOUND, use_gate_in_kernel=USE_GATE_IN_KERNEL,
+        A_log=inputs.A_log, dt_bias=inputs.dt_bias,
+    )
+    return out[0], out[1]
 
 
 ARMS: dict[str, Callable[[Inputs, Case], tuple]] = {
     "ascendc": run_ascendc,
-    "triton": run_triton,
     "cann": run_cann,
     "fla": run_fla,
 }
 
-# What to say when an arm cannot run, instead of a traceback. The CANN arm's
-# own message already explains how to build it.
+# The arm speedups are quoted against. The reference arms are the bar, not the
+# standard: correctness is decided by `run_torch` for all three alike.
+TARGET = "ascendc"
+
+# What to say when an arm cannot run, instead of a traceback.
 UNAVAILABLE_MARKERS = (
     "not implemented",
-    "no custom op vendor packages",
-    "no libcust_opapi.so",
-    # A vendor package is installed but it is the sibling bench's operator, not
-    # this one.
-    "export no aclnnChunkKdaFwd",
+    # `ref_ops`' own message when a vendor package was never built.
+    "run `python -m ref_ops.build` first",
 )
-
-
-def wrong_vendor(name: str) -> Optional[str]:
-    """Why arm ``name`` is not reachable in *this* process, or None.
-
-    Checked before the arm is probed, because probing a deselected arm is the
-    failure mode this exists to prevent: the loser of the `ChunkKdaFwd`
-    registration does not raise, it segfaults.
-    """
-    if name in VENDORS and name != VENDOR:
-        return f"not selected: {VENDOR_ENV}={VENDOR}"
-    return None
 
 
 def unsupported_shape(name: str, case: Case) -> Optional[str]:
@@ -340,13 +472,15 @@ def unsupported_shape(name: str, case: Case) -> Optional[str]:
     shape, and an arm that is installed and working for most rows must not be
     dropped from all of them -- nor silently crash on the rows it does not
     cover, which is what a single-shape probe would allow.
+
+    ``fla`` is the case in point: its L2-normalizing three-stage path is the
+    only one that accepts these inputs and it refuses every chunk size but 64,
+    with ``chunkSize only supports 64`` from the workspace call. So it covers
+    the C64 rows and reports ``-`` on the C128 ones, rather than being skipped
+    outright for a limit that applies to half the table. ``cann`` runs both.
     """
     if name == "fla" and case.chunk_size != 64:
-        # `aclnn_chunk_kda_fwd.cpp` rejects anything else in parameter
-        # validation ("chunkSize only supports 64."), and its api.md documents
-        # that as the supported range rather than a gap. So this is scope, not
-        # a bug to report per row.
-        return "supports chunk_size=64 only"
+        return "fla's KDA chunk path supports chunk_size=64 only"
     return None
 
 
@@ -371,20 +505,33 @@ def arm_status(name: str, case: Case) -> Optional[str]:
 
 
 def bench_one(case: Case, target_name: str, reference_names: list[str]):
-    """One row: every live arm validated against fp64, then all of them timed.
+    """One row: every live arm validated against the anchor, then all timed.
 
     Validation is done here rather than through the framework's
     target-vs-reference comparison, because correctness is not a question about
-    the target: each arm is checked against ``reference.py`` independently, so a
+    the target: each arm is checked against ``run_torch`` independently, so a
     wrong *reference* arm is reported as wrong instead of silently becoming the
-    standard the target is held to.
+    standard the target is held to. That matters more with these two arms than
+    it did with none -- they agree with each other to a bf16 ulp, which would
+    make a shared misreading of the inputs look like consensus.
 
     That leaves the framework doing what it is good at -- warmup, repeats and
     paired statistics -- and keeps the measurement meaningful even when the
     target is the only live arm.
     """
     inputs = make_inputs(case)
-    expected = tuple(t.float() for t in run_reference(inputs, case))
+    try:
+        # `.cpu()` as well as `.float()`: the arms are compared on the host
+        # below, and `assert_close` treats device as an attribute to match, so
+        # an anchor left on the NPU fails every comparison on the device alone
+        # -- including against a bit-identical tensor. A CPU anchor is also what
+        # the docstring above asks for, since fp64 has no NPU implementation.
+        expected = tuple(t.float().cpu() for t in run_torch(inputs, case))
+    except NotImplementedError:
+        # No anchor yet: measure, and report validity as unknown rather than
+        # as PASS. Timing a kernel before it can be checked is useful; calling
+        # it correct because nothing contradicted it is not.
+        expected = None
 
     # An arm that does not cover this shape is left out of both the validation
     # and the measurement, so its cells read `-` on this row and stay populated
@@ -393,8 +540,11 @@ def bench_one(case: Case, target_name: str, reference_names: list[str]):
         name for name in reference_names if unsupported_shape(name, case) is None
     ]
 
-    validity = {}
+    validity: dict[str, Optional[bool]] = {}
     for name in [target_name, *live]:
+        if expected is None:
+            validity[name] = None
+            continue
         got = tuple(t.float().cpu() for t in ARMS[name](inputs, case))
         try:
             comparator(got, expected)
@@ -408,9 +558,10 @@ def bench_one(case: Case, target_name: str, reference_names: list[str]):
             Reference(name=name, fn=functools.partial(ARMS[name], inputs, case))
             for name in live
         ],
-        # Validation already happened above, against fp64. Passing a comparator
-        # that accepts anything keeps the framework from re-deciding
-        # correctness by comparing two arms to each other.
+        # Validation already happened above, against the anchor. Passing a
+        # comparator that accepts anything keeps the framework from re-deciding
+        # correctness by comparing the arms to each other -- which here would
+        # compare two kernels that are not the anchor and pass.
         comparator=lambda actual, expected_: None,
         measurer=NpuEventMeasurer(),
         config=CONFIG,
@@ -430,6 +581,12 @@ def print_table(rows, target_name: str, reference_names: list[str]):
     for name in reference_names:
         headers += [f"{name} (ms)", f"vs {name}", f"{name} ok"]
 
+    def ok(validity: dict, name: str) -> str:
+        # `None` is "no anchor to check against", which is neither PASS nor
+        # FAIL and must not read as either.
+        verdict = validity.get(name)
+        return "-" if verdict is None else ("PASS" if verdict else "FAIL")
+
     table = []
     for label, (result, validity) in rows:
         target = result.target.measurement
@@ -437,7 +594,7 @@ def print_table(rows, target_name: str, reference_names: list[str]):
             label,
             f"{target.median_ms:.4f}" if target else "-",
             f"{target.mad_ms:.4f}" if target else "-",
-            "PASS" if validity.get(target_name) else "FAIL",
+            ok(validity, target_name),
         ]
         by_name = {ref.name: ref for ref in result.references}
         for name in reference_names:
@@ -451,7 +608,7 @@ def print_table(rows, target_name: str, reference_names: list[str]):
                 f"{measurement.median_ms / target.median_ms:.2f}x"
                 if target and target.median_ms > 0 else "-"
             )
-            row.append("PASS" if validity.get(name) else "FAIL")
+            row.append(ok(validity, name))
         table.append(row)
 
     widths = [len(h) for h in headers]
@@ -473,22 +630,17 @@ def print_table(rows, target_name: str, reference_names: list[str]):
     legend = [
         (f"{target_name} (ms)", "median latency of the target arm"),
         ("MAD", "median absolute deviation of that latency"),
-        ("<arm> ok", "agrees with the fp64 reference at the tolerance above"),
+        ("<arm> ok", "agrees with `run_torch` at the tolerance above;\n"
+                     "'-' means there is no anchor to check against yet"),
         ("vs <arm>", "median(arm) / median(target), >1 means target is faster"),
     ]
     arms = [
-        ("cann", "CANN 9.2.0 ChunkKdaFwd, built from source as a custom op\n"
-                 "package; also writes the mandatory Aqk/Akk intermediates,\n"
-                 "which stays in its measured time"),
-        ("triton", "triton_kda_chunk.py, five kernels over the same data"),
-        ("fla", "flash-linear-attention-npu chunk_kda_fwd, from the installed\n"
-                "wheel; also writes gk/Aqk/Akk, which stays in its measured\n"
-                "time. '-' on the C128 rows: it supports chunk_size=64 only"),
-        ("ascendc", "the sglang GLM-5.3 plugin kernel, not yet implemented"),
+        ("ascendc", "the sglang GLM-5.3 plugin kernel, written here"),
+        ("cann", "CANN 9.2.0 ChunkKdaFwd, via ref_ops.cann"),
+        ("fla", "flash-linear-attention-npu, via ref_ops.fla_npu;\n"
+                "chunk_size=64 only, so '-' on the C128 rows"),
     ]
-    # Describe only the arms this table has columns for. The deselected vendor
-    # is explained once, in the skip line above the table, so repeating it here
-    # would read as a column that failed to print.
+    # Describe only the arms this table has columns for.
     arms = [
         (name, text) for name, text in arms
         if name == target_name or name in reference_names
@@ -497,7 +649,10 @@ def print_table(rows, target_name: str, reference_names: list[str]):
 
     print()
     for name, text in legend:
-        print(f"{name.ljust(pad)} : {text}")
+        head, *rest = text.split("\n")
+        print(f"{name.ljust(pad)} : {head}")
+        for line in rest:
+            print(f"{' ' * pad}   {line}")
     print()
     for name, text in arms:
         head, *rest = text.split("\n")
@@ -506,46 +661,8 @@ def print_table(rows, target_name: str, reference_names: list[str]):
             print(f"{' ' * pad}   {line}")
 
 
-def run_every_vendor() -> int:
-    """Re-run this script once per vendor, in a fresh process each time.
-
-    What makes a subprocess necessary rather than fussy: the losing
-    `ChunkKdaFwd` registration cannot be undone within a process, and the
-    handler list the dlsym search uses is cached in a function-local static on
-    the first aclnn call. So "both arms in one run" has to mean two processes,
-    and this is the thing that makes `python bench_kda_chunk.py` still do it.
-
-    Each child prints its own full table. `triton` and the target arm run in
-    both, which is what keeps the two tables comparable: the vendor-specific
-    arm changes, the baseline does not.
-    """
-    import subprocess
-    import sys
-
-    failed = 0
-    for i, vendor in enumerate(VENDORS):
-        if i:
-            print()
-        print("=" * 72)
-        print(f"=== {VENDOR_ENV}={vendor}")
-        print("=" * 72)
-        print(flush=True)
-        completed = subprocess.run(
-            [sys.executable, os.path.abspath(__file__)],
-            # Setting the variable is also what tells the child it is the
-            # measurement rather than another driver.
-            env={**os.environ, VENDOR_ENV: vendor},
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-        )
-        if completed.returncode != 0:
-            failed += 1
-            print(f"\n{VENDOR_ENV}={vendor} exited {completed.returncode}")
-    return failed
-
-
 def main() -> None:
-    print(f"tolerance: rtol={RTOL} atol={ATOL}  (each arm vs the fp64 reference)")
-    print(f"vendor: {VENDOR}  ({VENDOR_ENV}; the other chunk arm is off the path)")
+    print(f"tolerance: rtol={RTOL} atol={ATOL}  (each arm vs run_torch)")
 
     # A small shape decides which arms are live, so an unavailable arm costs
     # one cheap launch rather than one per row. Each arm is probed on a shape
@@ -561,10 +678,6 @@ def main() -> None:
 
     status = {}
     for name in ARMS:
-        reason = wrong_vendor(name)
-        if reason is not None:
-            status[name] = reason
-            continue
         probe = probe_case(name)
         if probe is None:
             status[name] = "covers none of the configured chunk sizes"
@@ -574,20 +687,29 @@ def main() -> None:
     live = [name for name, reason in status.items() if reason is None]
     skipped = {name: reason for name, reason in status.items() if reason is not None}
 
-    target_name = TARGET
-    if target_name is None:
-        target_name = "ascendc" if "ascendc" in live else "triton"
-    if target_name not in live:
+    if TARGET in live:
+        target_name = TARGET
+    elif live:
+        # The target is what this benchmark is for, but with reference arms
+        # present its absence no longer leaves nothing to measure: the two
+        # outside kernels on these shapes are the bar the target is aiming at,
+        # and that number is worth having before the target exists. The first
+        # live arm stands in so the speedup column has a denominator; it is
+        # labelled as the target in the table, so what is being quoted against
+        # what stays readable.
+        target_name = live[0]
         print()
-        print(f"target arm '{target_name}' is unavailable: {skipped[target_name]}")
-        if target_name == "ascendc":
-            print("measuring 'triton' as the target instead.")
-            target_name = "triton"
-        else:
-            raise SystemExit(1)
+        print(f"target arm '{TARGET}' is unavailable: {skipped[TARGET]}")
+        print(f"measuring the reference arms instead, against '{target_name}'.")
+    else:
+        print()
+        for name, reason in skipped.items():
+            print(f"{name} is unavailable: {reason}")
+        print()
+        print("no arm can run; nothing to measure.")
+        raise SystemExit(1)
 
-    reference_names = [name for name in ("cann", "triton", "fla", "ascendc")
-                       if name in live and name != target_name]
+    reference_names = [name for name in ARMS if name in live and name != target_name]
 
     print(f"target: {target_name}")
     print(f"references: {', '.join(reference_names) or 'none'}")
@@ -599,10 +721,9 @@ def main() -> None:
 
     if not reference_names:
         # Still worth running: the target's own correctness and latency are
-        # measured against the fp64 reference, which is the part that does not
-        # depend on another arm existing.
+        # measured against the anchor, which is the part that does not depend
+        # on another arm existing.
         print("no other arm is available; measuring the target on its own.")
-        print("build the CANN op with `python build_cann_op.py` to compare.")
         print()
 
     rows = []
@@ -620,11 +741,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Invoked bare: drive one child per vendor, so a plain run still covers
-    # both chunk arms. With the variable already set -- by the driver below or
-    # by hand -- this process is the measurement and runs a single vendor.
-    if VENDOR_ENV not in os.environ:
-        raise SystemExit(run_every_vendor())
-
     torch.npu.set_device(DEVICE)
     main()
