@@ -53,7 +53,7 @@ matmul、重复平方求逆、每 chunk 九个会合），读的时候以本文�
 |---|---|---|---|
 | load qkva 至 ub 并 cast fp32 | | `LoadChunk`/`StageCast`：行在 GM 里按 `H` 跨步，每张量两次半 chunk `DataCopy` + `Cast`，共用一个 8 KB staging tile。**必须有 `V_MTE2`**，否则 MTE2 跑在 `Cast` 前面把 tile 盖掉，六次 `Cast` 全读到最后一次拷贝的行 | 空转 |
 | 生成 beta 的原始值 | | `b` 每行只有 1 个 bf16 且按 `H` 跨步，`DataCopy` 一个 datablock 只搬 1 个有用元素，所以 scalar `GetValue` 逐行取 | 空转 |
-| 预计算 qn / kn / g / beta / cumsum | | `PrepareFactors`，语义同 recurrent 的 `kda_pre_torch`，但一次做整 chunk 64 行。精度点：`tl.sum` 的两半折叠（`ReduceRows128_AS`）、`sqrt` 和倒数走 **Scalar**（向量 `Div`/`Sqrt` 差 1 ulp）、gate 用真除法。**cumsum 是 63 次串行行 `Add`**，每次夹一个 `PipeBarrier<PIPE_V>` | 空转 |
+| 预计算 qn / kn / g / beta / cumsum | | `PrepareFactors`，语义同 recurrent 的 `kda_pre_torch`，但一次做整 chunk 64 行。精度点：`tl.sum` 的两半折叠——用两次 `WholeReduceSum(mask=64, repeat=rows, srcRepStride=16)` 一次性处理所有行的 lo/hi 两半，再 `Add` 合并，匹配 `tl.sum` 的折叠顺序；`sqrt` 和倒数走 **Scalar**（向量 `Div`/`Sqrt` 差 1 ulp）、gate 用真除法。**cumsum 是 63 次串行行 `Add`**，每次夹一个 `PipeBarrier<PIPE_V>` | 空转 |
 | 逐行广播、per-row `Muls` | | 原表说的"rows 16→64 引入不必要的操作"指这里：归一化因子和 beta 都是 per-row 标量，`Muls` 只吃标量，所以 64 行就是 64 条指令，recurrent 的 16 行只要 16 条。同理 `Add` bias、`Div` gate 各 64 条 | 空转 |
 | $\mathrm{row}^{(R)}, \mathrm{col}^{(R)}$ 的构造 | | `WriteRebased`，**2 个 rebase 块**（不是 4 个）。每块：32 次 `Sub` 作 $\gamma - m$（带 `src1RepStride = 0` 的广播 `Sub` 会让 vector core 故障，所以只能逐行）、一次 `Exp`、两次 `Mul` 分别乘进 kn/qn，再 `StoreRows` 到 workspace。$A_{kk}$ 与 $A_{qk}$ 共用 $e^{\gamma-m}$，列因子只算一份 | 空转 |
 | ══ 会合 1 ══ | | | |

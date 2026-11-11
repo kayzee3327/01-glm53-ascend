@@ -9,7 +9,6 @@
 
 #include "kernel_operator.h"
 #include "kda_varlen_chunk.h"
-#include "utils.h"
 
 #ifndef __CCE_KT_TEST__
 #include <acl/acl.h>
@@ -246,6 +245,7 @@ private:
         static constexpr uint32_t BRAW_ADDR = TMP_ADDR + TILE_F32;
         static constexpr uint32_t BETA_ADDR = BRAW_ADDR + BT * sizeof(float);
         static constexpr uint32_t NRM_ADDR = BETA_ADDR + BT * sizeof(float);
+        // hi-half partial sums for WholeReduceSum norm accumulation; BT floats.
         static constexpr uint32_t RED_ADDR =
             NRM_ADDR + 2 * BT * sizeof(float);
         // `b_dt_bias` for this head, loaded once per block.
@@ -531,14 +531,26 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::PrepareFactors(
 
     // ── the two L2 norms ─────────────────────────────────────────────
     //
-    // `tl.sum` folds the two 64-lane halves before reducing; a plain 2x64
-    // WholeReduceSum pair does not match it.
+    // WholeReduceSum(mask=64, repeat=rows, srcRepStride=16) reduces each
+    // row's lo/hi 64-lane halves across all rows in one call; Add combines
+    // them.  Matches tl.sum's fold order.  srcRepStride=16: 128×fp32=16 DataBlocks.
+    constexpr int32_t kRepStride = static_cast<int32_t>(config::D / 8);  // 16
+
     AscendC::Mul(tmpLocal, qnLocal, qnLocal, rows * D);
     AscendC::PipeBarrier<PIPE_V>();
-    ReduceRows128_AS<config::BT>(tmpLocal, redLocal, nrmLocal);
+    AscendC::WholeReduceSum<float>(nrmLocal,             tmpLocal,     64, rows, 1, 1, kRepStride);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::WholeReduceSum<float>(redLocal,             tmpLocal[64], 64, rows, 1, 1, kRepStride);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Add(nrmLocal, nrmLocal, redLocal, rows);
+    AscendC::PipeBarrier<PIPE_V>();
     AscendC::Mul(tmpLocal, knLocal, knLocal, rows * D);
     AscendC::PipeBarrier<PIPE_V>();
-    ReduceRows128_AS<config::BT>(tmpLocal, redLocal, nrmLocal[config::BT]);
+    AscendC::WholeReduceSum<float>(nrmLocal[config::BT], tmpLocal,     64, rows, 1, 1, kRepStride);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::WholeReduceSum<float>(redLocal,             tmpLocal[64], 64, rows, 1, 1, kRepStride);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Add(nrmLocal[config::BT], nrmLocal[config::BT], redLocal, rows);
     AscendC::SetFlag<AscendC::HardEvent::V_S>(kda_chunk::EVENT_V_S);
     AscendC::WaitFlag<AscendC::HardEvent::V_S>(kda_chunk::EVENT_V_S);
 

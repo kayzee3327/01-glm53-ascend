@@ -94,8 +94,8 @@ Notes on individual buffers:
 
 * **`BRAW`/`BETA`/`NRM`** — beta's `1 + exp(-b)` denominators and the two L2
   norms, a whole 64-lane repeat each so `Exp` never reads uninitialized UB.
-* **`RED`** — `ReduceRows128_AS` folds a row's two halves into this and
-  reduces it, so one 64-lane repeat is all it needs.
+* **`RED`** — holds the hi-half partial sums from `WholeReduceSum`; one
+  64-element float repeat covers all `BT` rows in one call.
 * **`LB`** — `lower_bound` as a tensor: `Div` takes both operands as tensors
   and `Divs` is unsupported, so the scalar has to be materialized.
 * **`SCR`** — Scalar/Vector exchange for `exp(A_log)`: no scalar exp here.
