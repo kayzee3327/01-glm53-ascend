@@ -26,44 +26,34 @@ static on the *first* operator launch in the process. An import deferred into an
 arm would run after the target had already launched, leaving both vendors
 unreachable for the rest of the run.
 
-## Measured bar
-
-From a full run on an idle card 4, with `ascendc` absent so `cann` stood in as
-the denominator:
-
-| shape | `cann` | `fla` |
-| --- | --- | --- |
-| H4 C64, T1k → T16k | 0.85 → 6.80 ms | 1.38 → 7.10 ms |
-| H8 C64, T1k → T16k | 0.95 → 8.83 ms | 1.26 → 9.01 ms |
-| H4 C128, T1k → T16k | 0.82 → 6.28 ms | — |
-| H8 C128, T1k → T16k | 0.95 → 8.43 ms | — |
-
-`cann` leads `fla` by 1.6x at T1k narrowing to 1.02-1.04x at T16k, so the two
-converge where the shapes are large enough to stop being launch-bound. C128 buys
-`cann` a few percent over C64. This is the bar the target is aiming at.
-
 ## Where the target stands
 
-First run with `ascendc` and the anchor both wired in, on the C64 rows the
-target covers (`fla` was not installed, so it is a skipped column here). Every
-row `PASS`es, target and reference alike:
+A full run on an idle card 4 at the constants currently in the file (H8, C64,
+T1k–4k), with every arm taking raw `BSND` inputs and fusing what it can. Every
+row `PASS`es, target and references alike:
 
-| shape | `ascendc` | `cann` | vs `cann` |
-| --- | --- | --- | --- |
-| H4 C64, T1k | 2.00 ms | 0.82 ms | 0.41x |
-| H4 C64, T16k | 28.42 ms | 7.09 ms | 0.25x |
-| H8 C64, T1k | 2.08 ms | 1.42 ms | 0.68x |
-| H8 C64, T16k | 28.76 ms | 9.16 ms | 0.32x |
+| shape | `ascendc` | `cann` | vs `cann` | `fla` | vs `fla` |
+| --- | --- | --- | --- | --- | --- |
+| H8 C64, T1024 | 2.03 ms | 0.95 ms | 0.47x | 1.99 ms | 0.98x |
+| H8 C64, T2048 | 3.83 ms | 1.40 ms | 0.37x | 2.10 ms | 0.55x |
+| H8 C64, T4096 | 7.36 ms | 2.59 ms | 0.35x | 2.34 ms | 0.32x |
 
-So 1.5-4x *slower* than `cann`, and the gap widens with `T`. Two things in the
-numbers are worth keeping in mind before reading that as a per-token cost:
+So the target is ~2-3x slower than `cann` and the gap widens with `T`. Against
+`fla` it is level at T1024 and falls behind from there — `fla` scales much
+better across this range (1.99 → 2.34 ms for 4x the tokens, against the
+target's 2.03 → 7.36 ms), so the target is close to flat-cost at T1k and
+increasingly per-token-bound after.
 
-* `ascendc` is nearly flat in `H` — 2.00 vs 2.08 ms at T1k, 28.42 vs 28.76 at
-  T16k — while `cann` pays 30-70% for the extra heads at T1k. One block per
-  (request, head) means H4 is 4 blocks, so the card is far from full at these
-  shapes and H8 doubles the block count almost for free.
-* The target's own `MAD` is 0.005-0.04 ms against medians of 2-29 ms, so these
+Two notes before reading those as kernel-vs-kernel ratios:
+
+* **`cann`'s column includes host work the other two fuse** — see the fusion
+  table below. Its kernel alone is faster than its column says.
+* The target's own `MAD` is 0.001-0.013 ms against medians of 2-7 ms, so these
   are stable measurements, not noise.
+
+Earlier revisions of this file quoted H4 and T16k rows and a `cann`-as-stand-in
+bar. Those came from different constants and, for the reference arms, from the
+host-prepared `TND` call this file no longer makes; `git log` has them.
 
 ## Removed arms
 
@@ -106,21 +96,80 @@ the padding row at slot zero — `q`/`k`/`v`/`a` as `[1, T, H, D]` bf16, `b` as
 two have to agree on their inputs or comparing them says nothing. The only
 addition here is `chunk_size`.
 
-`prepare_tnd` does the per-arm adaptation: squeeze to TND, and L2-normalize
-`q`/`k` and sigmoid `beta` in fp32. The normalization is not a choice — the
-`ref_ops` CANN bridge exposes no `use_qk_l2norm_in_kernel` flag, and `fla`'s
-in-kernel path refuses every chunk size but 64, so the host form is the only one
-both arms can be measured in. It lives inside the arms rather than in
-`make_inputs` because the deployed path pays it per call, which also leaves the
-target free to fuse it and be credited.
+## What each arm is given, and what it fuses
 
-`run_ascendc` is the arm that takes that credit: it does not call `prepare_tnd`
-at all. `kda_varlen_chunk` accepts the caller's `[1, T, H, D]` tensors and the
-raw gate and beta, and does both L2 norms, both sigmoids and the bounded gate in
-its AIV prologue. The two conversions it does need are layout, not math:
-`dt_bias` back to `[HV, K]`, and a `clone_state` of the pool — the op updates
-state in place where the chunk references return a new tensor, so without the
-copy each timed call would start from the previous one's final state.
+Every arm is called with the inputs **raw and unmodified**: rank-4
+`[1, T, H, D]` as `BSND`, un-normalized `q`/`k`, raw gate `a`, raw `beta`
+logits, `A_log`, `dt_bias`, and the state pool in its own orientation. There is
+no shared host preparation step any more.
+
+| arm | L2 norms | beta sigmoid | bounded gate |
+| --- | --- | --- | --- |
+| `ascendc` | in kernel | in kernel | in kernel |
+| `fla` | in kernel | in kernel | in kernel |
+| `cann` | **host** | **host** | in kernel |
+
+`cann` is the exception and it is a capability gap, not a calling mistake. That
+operator has exactly seven attributes — `layout`, `scale`, `chunk_size`,
+`safe_gate`, `lower_bound`, `use_gate_in_kernel`, `state_v_first` — and none is
+a normalization, an epsilon or a sigmoid. `beta` is consumed as a plain
+multiplicative coefficient on every kernel path, so passing raw logits would
+silently compute the wrong thing rather than activate them. Nothing closes the
+gap: `recurrent_kda` has both flags but is the decode kernel, and
+`kda_input_proj` does fuse the beta sigmoid but is the projection stage and
+subsumes the QKV GEMMs. So the `cann` column is that arm's honest end-to-end
+cost on these inputs, with `host_l2norm` and a host sigmoid inside its timed
+region — worth ~0.1 ms of 0.87 ms at T1024, shrinking with `T`.
+
+This replaced a single `prepare_tnd` that normalized on the host for both
+reference arms. That was wrong in two ways, both measured:
+
+* **It charged `fla` for work it can fuse.** Fully fused, `fla` runs 2.12 ms
+  against 2.77 ms host-prepared at H8 T1024 — the host form was inflating it by
+  ~24%. The file justified the host path by claiming `fla`'s in-kernel
+  normalization "refuses every chunk size but 64"; the constraint is real but
+  C64 is the only size this benchmark runs and the only one `ascendc` supports.
+* **It called both arms in `TND`.** Both accept rank-4 `BSND` with `cu_seqlens`
+  at `B=1`, bit-identically (`0.0e+00` on both outputs, for both arms). `BSND`
+  is also cheaper for `cann`: the aclnn layer normalizes every layout to
+  head-major before launching and materializes one transpose per tensor it
+  moves, so `TND` moves five (q, k, v, g, beta) where `BSND` moves only `beta`.
+  Worth 9.2% at T1024, fading to 0.2% by T4096 — fixed overhead, not per-token.
+
+Reaching `BSND` on `cann` needed a `ref_ops` change: that bridge is ours, not
+upstream's, and it hardcoded `TORCH_CHECK(q.dim() == 3)`. It now accepts rank-3
+`TND`/`NTD` and rank-4 `BSND`, sizing `attn_out`/`Aqk`/`Akk` by input rank,
+which is what the aclnn layer checks against.
+
+## State layout
+
+All four arms read and write the state in the **pool's own orientation** — `K`
+fastest, which is what `native_state` allocates, what the Ascend C op requires
+and checks for with `stride(2)==1 && stride(3)==128`, and what the deployed
+backend normalizes both of its pools to. The reference ops spell that
+`state_v_first`: a contiguous `[N, HV, V, K]`. `native_live_state` gathers it,
+and `k_first` transposes their result back into the `[N, HV, K, V]` arm
+contract. `ascendc` and `run_torch` take the pool itself and need neither — they
+write their state where the pool already keeps it and read it back as a view.
+
+Before this, the reference arms were gathered into a contiguous `[N, HV, K, V]`,
+so the two outside kernels were handed a transposed copy of the pool rather than
+the pool. That is a correctness-of-comparison point rather than a speed one: the
+repack measured 0.025 ms per call at H8 against medians of 1–7 ms, and removing
+it moved no arm outside its `MAD`. It is worth having because `state_v_first` is
+a tiling attribute of both reference kernels, not a host-side transpose, so an
+arm fed a layout the deployment never produces could be measuring a different
+kernel path for free. Both were checked under the flag and return results
+*bit-identical* to the K-first spelling on these inputs, so it buys the shared
+layout and changes nothing else.
+
+`run_ascendc` does no host preparation at all: `kda_varlen_chunk` accepts the
+caller's `[1, T, H, D]` tensors and the raw gate and beta, and does both L2
+norms, both sigmoids and the bounded gate in its AIV prologue. The two
+conversions it does need are layout, not math: `dt_bias` back to `[HV, K]`, and
+a `clone_state` of the pool — the op updates state in place where the chunk
+references return a new tensor, so without the copy each timed call would start
+from the previous one's final state.
 
 The gate stays raw: `A_log`, `dt_bias` and the bounded sigmoid are applied
 in-kernel under `use_gate_in_kernel`, as the deployment runs it. The convention
@@ -181,20 +230,27 @@ inputs would look like consensus.
 
 `RTOL = 2e-2`, `ATOL = 2e-4`, for bf16 inputs accumulated in fp32.
 
-Measured against the anchor, both arms clear those by a wide margin, and by very
-different amounts:
+Measured against the anchor at H8 T1024 C64, all three arms clear those by a
+wide margin, and by very different amounts:
 
 | arm | `attn_out` max | `final_state` max |
 | --- | --- | --- |
-| `ascendc` | 3.0e-5 | 1.0e-7 |
-| `cann` | 8.8e-5 | 6.4e-4 |
+| `ascendc` | 3.1e-5 | 3.6e-8 |
+| `cann` | 7.8e-5 | 4.9e-4 |
+| `fla` | 8.3e-5 | 4.9e-4 |
 
-`ascendc` sits four orders of magnitude closer on `final_state` than `cann`
-does, and it is worth being clear about why that is not a quality claim: the
-kernel was written from this same reference, so the two share their summation
-order over the state update where `cann`'s differs. That is also why `cann`
-remains worth having as a column — an error the reference and the kernel share
-is exactly the kind this comparison cannot see, and the one `cann` can.
+`ascendc` sits four orders of magnitude closer on `final_state` than either
+reference, and it is worth being clear about why that is not a quality claim:
+the kernel was written from this same reference, so the two share their
+summation order over the state update where the references' differs. That is
+also why the reference columns are worth having — an error the anchor and the
+kernel share is exactly the kind this comparison cannot see, and the kind they
+can.
+
+The two references agreeing with each other to 4.9e-4 on `final_state` while
+differing from the anchor by the same amount is the expected shape of that: they
+are two independent kernels with the same summation order, not two readings of
+one.
 
 Which bound binds was measured on these inputs at H4 T1024 C64: `|attn_out|`
 runs ~5e-4 mean with a ~1.6e-2 max, so most of it sits under `atol` and `atol`

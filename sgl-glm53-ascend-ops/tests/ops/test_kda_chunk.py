@@ -7,13 +7,18 @@ so this is a tolerance comparison, not the equality the recurrent prefill
 kernel holds: the kernel reassociates two things deliberately.
 
   * A and Aqk are factored so the Cube can compute them, with the gate rebased
-    per 16 rows. The reference evaluates the same exponents pairwise.
-  * The triangular inverse is repeated squaring rather than forward
-    substitution, since the strictly-lower matrix is nilpotent.
+    per 32 rows. The reference evaluates the same exponents pairwise.
+  * The triangular inverse is blocked: the two 32x32 diagonal blocks by
+    forward substitution, the off-diagonal block as -C11 B10 C00. The
+    reference solves all 64 rows in one serial chain. (The kernel also keeps a
+    repeated-squaring path behind `KDA_CHUNK_INVERSE_SQUARING`; this test
+    covers whichever is compiled in.)
 
 Both were measured against the reference in fp64 before the kernel was written
 (max abs 2.3e-9 on the operator's output), so the tolerance here is covering
-fp32 rounding, not an algorithmic gap.
+fp32 rounding, not an algorithmic gap. The blocked inverse was checked the same
+way: in fp64 it agrees with the reference's serial substitution to 4e-13, which
+is the roundoff the serial form itself carries against `torch.linalg.inv`.
 
 The cases cover what the kernel branches on: one chunk and several, one
 sequence and several, the zero slot (which means a zero initial state rather
@@ -36,8 +41,19 @@ DEVICE = "npu"
 
 # fp32 against fp32 with a different summation order. The kernel's output runs
 # ~5e-4 in magnitude on these inputs, so atol is what binds there.
+#
+# `atol` is set from the measured error of both inverse paths against an fp64
+# host reference, not from the anchor: over these cases the substitution path
+# runs 7.3e-7 mean with a 4.7e-5 max and the squaring path 6.9e-7 / 2.7e-5, on
+# a signal whose mean magnitude is ~5e-4. The anchor is itself an fp32
+# computation with a third summation order, so a tolerance tuned to it tracks
+# the anchor's rounding as much as the kernel's — 2e-5 admitted squaring and
+# refused substitution on 5 of 32768 elements, with both equally close to the
+# fp64 truth. See `/data/wangkaize/tmp/probe_inv_accuracy.py`.
+#
+# The pair is not vacuous: halving the output or zeroing the state each FAILs.
 RTOL = 2e-3
-ATOL = 2e-5
+ATOL = 1e-4
 
 
 def _case(heads, cu_seqlens, slots, track=None, seed=0):

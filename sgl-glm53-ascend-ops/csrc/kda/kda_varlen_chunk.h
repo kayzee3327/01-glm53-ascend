@@ -1,10 +1,10 @@
 // GLM-5.3 chunked KDA — seam between the host op and the kernel.
 //
 //   kda_varlen_chunk.cpp          host: validation, workspace, registration
-//   kda_varlen_chunk_kernel.cpp   the MIX kernel (one AIC + two AIV per block)
+//   kda_varlen_chunk_kernel.cpp   the MIX kernel (1 AIC + 2 AIV per block)
+//   kda_varlen_chunk.md           design notes
 //
-// Included by both the host TU (which also includes torch) and the device TU,
-// so it must stay free of torch headers.
+// Included by the host TU as well, so it must stay free of torch headers.
 
 #pragma once
 
@@ -17,21 +17,36 @@ constexpr int64_t chunk_config_D = 128;
 
 namespace kda_chunk {
 
-// Tokens per chunk. A compile-time constant rather than an argument: the UB
-// map, the workspace stride and the rebase block count are all derived from
-// it. 128 is the other value the algebra admits; see the kernel header.
+// Tokens per chunk. Compile-time: the UB map, the workspace stride and the
+// rebase block count all derive from it.
 constexpr uint32_t kChunkTokens = 64;
 
-// Rows per gate-rebase block. NOT a tuning knob — a correctness bound. The
-// factored A/Aqk a Cube matmul needs splits one bounded exponent
-// exp(gc[r]-gc[c]) into exp(gc[r]-m) * exp(m-gc[c]), and the cumulative gate
-// spans ~177 over 64 tokens on deployed inputs. Measured max exponent by
-// rebase granularity: whole chunk NaN, 32 rows +88.4 (fp32 overflows at
-// +88.7), 16 rows +43. Sixteen is the margin.
-constexpr uint32_t kRebaseRows = 16;
+// Rows per gate-rebase block. NOT a tuning knob — a correctness bound on the
+// factored A/Aqk's positive exponent, which fp32 exp overflows at +88.7.
+// Measured margins and why the anchor is the midpoint: kda_varlen_chunk.md.
+constexpr uint32_t kRebaseRows = 32;
 constexpr uint32_t kRebaseBlocks = kChunkTokens / kRebaseRows;
 static_assert(kChunkTokens % kRebaseRows == 0,
               "the chunk must split into whole rebase blocks");
+
+// ── Which triangular inverse ─────────────────────────────────────────
+//
+//   0 (default)  FLA-style blocked forward substitution, 104.7 us/chunk
+//   1            repeated squaring, the original, 110.8
+//
+// Both are validated. Select with CMake -DKDA_CHUNK_INVERSE=squaring; the md
+// has the breakdown.
+#ifndef KDA_CHUNK_INVERSE_SQUARING
+#define KDA_CHUNK_INVERSE_SQUARING 0
+#endif
+
+// Side length of a substitution-solved diagonal block. 32 is FLA's
+// `SUB_CHUNK_SIZE` and splits the chunk two ways, which is both the fewest a
+// substitution can use and what the AIV pair solves concurrently.
+constexpr uint32_t kInvBlock = 32;
+constexpr uint32_t kInvBlocks = kChunkTokens / kInvBlock;
+static_assert(kInvBlocks == 2,
+              "the off-diagonal merge is written for exactly two blocks");
 
 // Squaring steps for the triangular inverse: (I - Araw)^-1 = prod_s
 // (I + Araw^(2^s)) because Araw is strictly lower triangular, hence nilpotent
@@ -40,11 +55,16 @@ constexpr uint32_t kInverseSteps = 6;
 static_assert((1u << kInverseSteps) == kChunkTokens,
               "the squaring chain must reach the nilpotency degree");
 
-// Cross-core flag IDs for the mode-2 (AIC <-> both AIV, within one block)
-// handshake. Range is 0-15; two are enough because the two directions never
-// have more than one message outstanding.
+// Mode-2 (AIC <-> both AIV, within one block) flag IDs, range 0-15.
+// `kFlagAivToAicAux` is a second forward ID so the inversion's handoff needs
+// no reply; see the md.
 constexpr uint16_t kFlagAivToAic = 0;
 constexpr uint16_t kFlagAicToAiv = 1;
+constexpr uint16_t kFlagAivToAicAux = 2;
+
+// Mode-1 (AIV <-> AIV) ID. The pair meets once per chunk, after the worker
+// publishes B11; nothing needs ordering on the way back.
+constexpr uint16_t kFlagAivToAiv = 3;
 
 // Per-block GM workspace, in fp32 elements. One block owns one slice, so no
 // two blocks share a cache line.
@@ -63,12 +83,16 @@ enum : uint32_t {
     kWsA = kWsColK + kRebaseBlocks * kTileBT_D,   // [64, 64]  Araw
     kWsAqk = kWsA + kTileBT_BT,                   // [64, 64]
     kWsX = kWsAqk + kTileBT_BT,                   // [64, 64]  running inverse
-    // The nilpotent power and the factor built from it are separate buffers:
-    // the chain squares Araw^(2^s) but multiplies by (I + Araw^(2^s)), and
-    // squaring the factor instead would give I + 2Araw^(2^s) + Araw^(2^(s+1)).
+    // Separate buffers: the chain squares Araw^(2^s) but multiplies by
+    // (I + Araw^(2^s)), and squaring the factor is not the same thing.
     kWsDpow = kWsX + kTileBT_BT,                  // [64, 64]  Araw^(2^s)
     kWsFactor = kWsDpow + kTileBT_BT,             // [64, 64]  I + Araw^(2^s)
     kWsScratch = kWsFactor + kTileBT_BT,          // [64, 64]  matmul landing
+    // The substitution path's operands, aliased onto the squaring path's
+    // scratch: only one path is compiled in, so they are never both live.
+    kWsInvB10 = kWsDpow,                          // [32, 32] Araw's (1,0)
+    kWsInvTmp = kWsFactor,                        // [32, 32] lands C11 B10
+    kWsInvB11 = kWsScratch,                       // [32, 32] for the helper
     kWsKgBeta = kWsScratch + kTileBT_BT,          // [64, 128] beta*(e^gc * kn)
     kWsVBeta = kWsKgBeta + kTileBT_D,             // [64, 128] beta * v
     kWsQg = kWsVBeta + kTileBT_D,                 // [64, 128] qn * e^gc
@@ -78,17 +102,12 @@ enum : uint32_t {
     kWsVNew = kWsU + kTileBT_D,                   // [64, 128]
     kWsOut = kWsVNew + kTileBT_D,                 // [64, 128] o accumulator
     kWsTmpBT_D = kWsOut + kTileBT_D,              // [64, 128] matmul landing
-    // S and its increment, both transposed: [V, K] row-major, not [K, V].
-    // The state pool is K-contiguous ([slots,H,K,V] with stride(2)==1), so a
-    // verbatim copy of a slot is already [V][K] and the alternative is a
-    // 128x128 transpose on the AIV. The three matmuls that touch S take it as
-    // a B_TRANS operand instead, and the increment is computed as
-    // vnew^T @ kdecay.
+    // S and its increment, both transposed: [V, K] row-major, which is what
+    // a verbatim copy of a K-contiguous pool slot gives. See the md.
     kWsState = kWsTmpBT_D + kTileBT_D,            // [128, 128] S^T
     kWsStateUpd = kWsState + kTileD_D,            // [128, 128] vnew^T @ kdecay
     // The chunk's start state, kept only when tracking: a tracked prefix
-    // state overwrites S, and the chunk's own update has to run from the
-    // value S had at the chunk's start.
+    // overwrites S and the chunk's own update must start from this.
     kWsStateSave = kWsStateUpd + kTileD_D,        // [128, 128] S^T
     kWsPerBlock = kWsStateSave + kTileD_D,
 };

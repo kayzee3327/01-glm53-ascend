@@ -1,32 +1,11 @@
 // GLM-5.3 chunked KDA — MIX kernel, one AIC and two AIV per block.
 //
 // Specializes `kda_chunk_torch` (bench/kda_chunk/kda_python.py) to BT == 64,
-// K == V == 128, H == HV. One block owns one (sequence, head) and walks its
-// chunks in order.
+// K == V == 128, H == HV. Banners map code to that reference: `══ NAME ══`
+// opens a stage, `── expr ──` marks one expression.
 //
-// `Process` is banner-commented against that reference: a `══ NAME ══` banner
-// opens a stage and lists the reference lines it covers, and a `── expr ──`
-// banner marks the instructions computing that one expression. Code between
-// two banners implements the upper one.
-//
-// Two departures from the reference's spelling, both forced by the hardware
-// and both measured bit-close (max abs 2.3e-9 over the whole operator):
-//
-//   * A and Aqk are factored so the Cube can compute them. The reference's
-//     pairwise `(g_c - g_i).exp()` keeps every exponent <= 0; the factored
-//     form splits it into exp(gc-m) * exp(m-gc), which overflows fp32 unless
-//     m is rebased often. The cumulative gate spans ~177 over 64 tokens, so
-//     the rebase is per 16 rows. See `kRebaseRows`.
-//   * The triangular inverse is repeated squaring, not forward substitution.
-//     Araw is strictly lower triangular, hence nilpotent (Araw^64 == 0), so
-//     (I - Araw)^-1 = prod_s (I + Araw^(2^s)) over 6 steps. That is 11 Cube
-//     matmuls and no sequential vector chain, where substitution would be 4
-//     serial 16-row solves on the Vector unit per chunk.
-//
-// Everything the Cube consumes travels through GM: `DataCopy` UB->L1 with
-// ND2NZ is a software simulation on this architecture that stages through the
-// high-level Matmul API's workspace and needs REGISTER_MATMUL, so a basic-API
-// kernel has no on-chip UB->L1 path.
+// Design notes, measurements and traps: kda_varlen_chunk.md, same directory.
+// Headings there are named by the code that points at them.
 
 #include "kernel_operator.h"
 #include "kda_varlen_chunk.h"
@@ -66,26 +45,15 @@ constexpr uint32_t kL1BOffset = 128 * 1024;
 
 // ── Cube: C = A @ B, or A^T @ B, or A @ B^T ───────────────────────────
 //
-// GM(ND) -> L1(Nz) -> L0A(Zz)/L0B(Zn) -> L0C(Nz) -> GM(ND), the chain the
-// devkit's load_data_l12l0 sample documents. Load3Dv2 does both L1->L0 moves:
-// with l1H=1 and a 1x1 filter it degenerates to a reformat, `enTranspose`
-// transposes into L0A, and a destination of L0B transposes unconditionally.
-//
-//   A_TRANS  A is stored [K, M] and the operand is its transpose
-//   B_TRANS  B is stored [N, K] and needs no transpose into L0B
-//   ACCUM    add into the destination instead of overwriting it
-//   dstRowStride  elements between consecutive rows of C in GM. Defaults to
-//                 N (a packed [M, N] result); pass the real row pitch when C
-//                 is a block of a wider tile.
-//   first         set on the block's first matmul, where there is no previous
-//                 call whose buffers have to be waited on.
+// GM(ND) -> L1(Nz) -> L0A(Zz)/L0B(Zn) -> L0C(Nz) -> GM(ND). The `*RowStride`
+// arguments default to 0, meaning packed. See kda_varlen_chunk.md.
 template <bool A_TRANS, bool B_TRANS>
 __aicore__ inline void CubeMatmul(
     const AscendC::GlobalTensor<float> &aGm,
     const AscendC::GlobalTensor<float> &bGm,
     const AscendC::GlobalTensor<float> &cGm,
     uint32_t M, uint32_t N, uint32_t K, uint32_t dstRowStride = 0,
-    bool first = false)
+    bool first = false, uint32_t aRowStride = 0, uint32_t bRowStride = 0)
 {
     using namespace kda_chunk;
 
@@ -112,16 +80,9 @@ __aicore__ inline void CubeMatmul(
     AscendC::LocalTensor<float> c1(AscendC::TPosition::CO1, 0, mAlign * nAlign);
 
     // ── GM(ND) -> L1(Nz) ──────────────────────────────────────────────
-    // L1, L0A/L0B and L0C are fixed addresses reused by every call, so each
-    // stage has to wait for the previous call's consumer to release the
-    // buffer it is about to overwrite:
     //
-    //   MTE1_MTE2  L1 refill waits for the last L1 -> L0 load
-    //   M_MTE1     L0A/L0B load waits for the last Mmad
-    //   FIX_M      Mmad waits for the last Fixpipe to drain L0C
-    //
-    // A single matmul needs none of these and is correct without them; a
-    // chain of them faults the core, which is how they were found.
+    // The three `!first` barriers release on-chip buffers the previous call
+    // still reads; a chain without them faults the core. See the md.
     if (!first) {
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
@@ -132,7 +93,8 @@ __aicore__ inline void CubeMatmul(
     ap.nValue = static_cast<uint16_t>(aRows);
     ap.dValue = static_cast<uint16_t>(aCols);
     ap.srcNdMatrixStride = 0;
-    ap.srcDValue = static_cast<uint16_t>(aCols);
+    ap.srcDValue =
+        static_cast<uint16_t>(aRowStride == 0 ? aCols : aRowStride);
     ap.dstNzC0Stride = static_cast<uint16_t>(aRowAlign);
     ap.dstNzNStride = 1;
     ap.dstNzMatrixStride = 0;
@@ -143,7 +105,8 @@ __aicore__ inline void CubeMatmul(
     bp.nValue = static_cast<uint16_t>(bRows);
     bp.dValue = static_cast<uint16_t>(bCols);
     bp.srcNdMatrixStride = 0;
-    bp.srcDValue = static_cast<uint16_t>(bCols);
+    bp.srcDValue =
+        static_cast<uint16_t>(bRowStride == 0 ? bCols : bRowStride);
     bp.dstNzC0Stride = static_cast<uint16_t>(bRowAlign);
     bp.dstNzNStride = 1;
     bp.dstNzMatrixStride = 0;
@@ -181,8 +144,8 @@ __aicore__ inline void CubeMatmul(
 
     // ── L1(Nz) -> L0B(Zn) ─────────────────────────────────────────────
     //
-    // B stored [N, K] is already the Zn orientation, so it goes in with
-    // Load2D; B stored [K, N] needs the transpose Load3Dv2 applies for L0B.
+    // B stored [N, K] is already Zn, so Load2D; [K, N] needs Load3Dv2's
+    // transpose.
     if constexpr (B_TRANS) {
         AscendC::LoadData2DParams p;
         p.repeatTimes = static_cast<uint8_t>(bRowAlign / kFracRow);
@@ -264,8 +227,8 @@ private:
         static constexpr uint32_t NB = kda_chunk::kRebaseBlocks;
     };
 
-    // UB map, laid out by hand at absolute addresses as in the recurrent
-    // kernels. Only the AIV touches it. ~84 KB of 192 KB.
+    // UB map, by hand at absolute addresses as in the recurrent kernels.
+    // Only the AIVs touch it. Per-buffer notes in the md.
     struct UbLayout {
         static constexpr uint32_t D = config::D;
         static constexpr uint32_t BT = config::BT;
@@ -280,79 +243,54 @@ private:
         static constexpr uint32_t TMP_ADDR = GC_ADDR + TILE_F32;
 
         // ── per-row scalars ───────────────────────────────────────────
-        // beta's `1 + exp(-b)` denominators and the two L2 norms, a whole
-        // 64-lane repeat each so Exp never reads uninitialized UB.
         static constexpr uint32_t BRAW_ADDR = TMP_ADDR + TILE_F32;
         static constexpr uint32_t BETA_ADDR = BRAW_ADDR + BT * sizeof(float);
         static constexpr uint32_t NRM_ADDR = BETA_ADDR + BT * sizeof(float);
-        // `ReduceRows128_AS` folds a row's two halves into this and reduces
-        // it, so one 64-lane repeat is all it needs.
         static constexpr uint32_t RED_ADDR =
             NRM_ADDR + 2 * BT * sizeof(float);
         // `b_dt_bias` for this head, loaded once per block.
         static constexpr uint32_t BIAS_ADDR = RED_ADDR + 64 * sizeof(float);
-        // `lower_bound` as a tensor: Div takes both operands as tensors and
-        // Divs is unsupported, so the scalar has to be materialized.
+        // `lower_bound` as a tensor, for the gate's Div.
         static constexpr uint32_t LB_ADDR = BIAS_ADDR + ROW_F32;
         // Scalar/Vector exchange for `exp(A_log)`: no scalar exp here.
         static constexpr uint32_t SCR_ADDR = LB_ADDR + D * sizeof(float);
-        // A second [64, 128] working tile, for the stages that need two live
-        // at once (the rebased factors, the auxiliary operands, the output
-        // sum, the state's row decay).
+        // The second [64, 128] working tile.
         static constexpr uint32_t NORM_ADDR = SCR_ADDR + 64 * sizeof(float);
-        // The bf16 staging tile, reused for q, k, a and v in turn. Half a
-        // chunk at a time: every use is a load immediately followed by the
-        // `Cast` that consumes it, so a half tile costs one extra copy and
-        // leaves the mask its own 16 KB.
+        // The bf16 staging tile, half a chunk, reused for q/k/a/v in turn.
         static constexpr uint32_t STAGE_ADDR = NORM_ADDR + TILE_F32;
-        // The lower-triangular mask, [64, 64] fp32, built once per block.
-        // Its own space, not aliased onto the staging tile: the staging tile
-        // is refilled mid-chunk, and an alias there made the mask depend on
-        // an ordering that is easy to break.
-        static constexpr uint32_t MASK_ADDR = STAGE_ADDR + TILE_BF16 / 2;
-        static constexpr uint32_t UB_END = MASK_ADDR + BT * BT * sizeof(float);
+        static constexpr uint32_t UB_END = STAGE_ADDR + TILE_BF16 / 2;
 
-        // ~187 KB of the 192 KB an AIV gets in MIX mode, as the recurrent
-        // kernels' maps also assume. Overrunning it faults the core rather
-        // than wrapping: `aivector error` with no further detail.
+        // 192 KB in MIX mode, not 256; overrunning it faults the core.
         static_assert(UB_END <= 192 * 1024, "the chunk UB map must fit");
     };
 
     __aicore__ inline void RunAiv();
     __aicore__ inline void RunAic();
 
-    // This block's workspace slice at element offset `off`. A member rather
-    // than a lambda: inside a `this`-capturing lambda the member tensor is
-    // const-qualified and `GlobalTensor::operator[]`, declared non-const,
-    // will not bind.
+    // This block's workspace slice at element offset `off`. A member, not a
+    // lambda: `operator[]` will not bind on a captured const member.
     __aicore__ inline AscendC::GlobalTensor<float> Slice(uint32_t off)
     {
         return wsGm[wsBase_ + static_cast<uint64_t>(off)];
     }
 
-    // UB <-> this block's workspace slice. Every Cube operand travels this
-    // way: there is no on-chip UB->L1 path in basic Ascend C.
-    __aicore__ inline void StoreRows(uint32_t off,
-                                     const AscendC::LocalTensor<float> &src,
-                                     uint32_t count)
+    // A [rows, cols] sub-block of a wider UB tile, packed into the
+    // workspace. `srcRowStride - cols` must be a multiple of 8 floats.
+    __aicore__ inline void StoreBlock(uint32_t off,
+                                      const AscendC::LocalTensor<float> &src,
+                                      uint32_t rows, uint32_t cols,
+                                      uint32_t srcRowStride)
     {
+        AscendC::DataCopyParams p{
+            static_cast<uint16_t>(rows),
+            static_cast<uint16_t>(cols * sizeof(float) / 32),
+            static_cast<uint16_t>((srcRowStride - cols) * sizeof(float) / 32),
+            0};
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
-        AscendC::DataCopy(Slice(off), src, count);
+        AscendC::DataCopy(Slice(off), src, p);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
-    }
-
-    // `V_MTE2` is the write-after-read on `dst`: the caller's previous Vector
-    // ops read the same tile and only `PIPE_V` barriers separate them, which
-    // do not order MTE2. The matching `MTE2_V` stays with the caller, which
-    // issues several loads before one wait.
-    __aicore__ inline void LoadRows(const AscendC::LocalTensor<float> &dst,
-                                    uint32_t off, uint32_t count)
-    {
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
-        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
-        AscendC::DataCopy(dst, Slice(off), count);
     }
 
     // AIV stages
@@ -363,16 +301,8 @@ private:
         const AscendC::LocalTensor<float> &dst, uint32_t rows);
     __aicore__ inline void PrepareFactors(uint32_t head, uint32_t rows);
     __aicore__ inline void WriteRebased(uint32_t rows);
-    __aicore__ inline void MaskAndNegate(uint32_t rows);
-    __aicore__ inline void BuildMask();
-    // X += I on a [BT, BT] fp32 tile, on Scalar.
-    //
-    // The diagonal has an element stride of BT + 1 == 65 and no vector form
-    // reaches it: `repeatStride` counts 32 B datablocks, so a strided `Adds`
-    // can only step by multiples of 8 elements, and a per-row `Adds` of one
-    // element at offset r*BT + r is 32 B aligned only when r % 8 == 0 — an
-    // unaligned vector destination faults the core with `aivector error`.
-    // rows scalar read-modify-writes against BuildMask's BT*BT.
+    // X += I on a [BT, BT] fp32 tile. On Scalar because no vector form
+    // reaches a stride-65 diagonal; see the md.
     __aicore__ inline void AddIdentity(
         const AscendC::LocalTensor<float> &x, uint32_t rows)
     {
@@ -385,8 +315,7 @@ private:
         }
         AscendC::SetFlag<AscendC::HardEvent::S_V>(kda_chunk::EVENT_S_V);
         AscendC::WaitFlag<AscendC::HardEvent::S_V>(kda_chunk::EVENT_S_V);
-        // Both callers hand the tile straight to `StoreRows`, so the scalar
-        // writes have to be visible to MTE3 as well as to Vector.
+        // The tile goes straight to MTE3, so the scalar writes need S_MTE3.
         AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(kda_chunk::EVENT_S_MTE3);
         AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(kda_chunk::EVENT_S_MTE3);
     }
@@ -394,7 +323,13 @@ private:
                                             uint32_t rows);
     __aicore__ inline void FinishChunk(uint32_t head, int32_t tok0,
                                        uint32_t rows);
+#if KDA_CHUNK_INVERSE_SQUARING
     __aicore__ inline void AdvanceInverse(uint32_t rows);
+#else
+    __aicore__ inline void SolveDiagBlocks(uint32_t rows);
+    __aicore__ inline void SolveDiagBlockHelper();
+    __aicore__ inline void SubstituteBlock(uint32_t r0, uint32_t rows);
+#endif
     __aicore__ inline void RebaseKDecay(uint32_t r);
     __aicore__ inline void ApplyStateUpdate(uint32_t refRow, uint32_t rows);
     __aicore__ inline void CopyStateOut(uint32_t slot, uint32_t head);
@@ -436,7 +371,6 @@ private:
     AscendC::LocalTensor<float> lbRowLocal;
     AscendC::LocalTensor<float> scrLocal;
     AscendC::LocalTensor<float> normLocal;
-    AscendC::LocalTensor<float> maskLocal;
 };
 
 template <bool TRACK_STATE>
@@ -486,43 +420,14 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::Init(
     lbRowLocal = L(P, UbLayout::LB_ADDR, D);
     scrLocal = L(P, UbLayout::SCR_ADDR, 64);
     normLocal = L(P, UbLayout::NORM_ADDR, BT * D);
-    maskLocal = L(P, UbLayout::MASK_ADDR, BT * BT);
-}
-
-// ── tril(ones) ───────────────────────────────────────────────────────
-//
-// 1 where c <= r, else 0. Built once per block; the two masked matrices use
-// it as a whole-tile multiply, with Aqk taking it as-is (it keeps the
-// diagonal) and Araw taking it shifted by one lane.
-template <bool TRACK_STATE>
-__aicore__ inline void KdaVarlenChunk<TRACK_STATE>::BuildMask()
-{
-    constexpr uint32_t BT = config::BT;
-    AscendC::Duplicate(maskLocal, 0.0f, BT * BT);
-    AscendC::PipeBarrier<PIPE_V>();
-    AscendC::SetFlag<AscendC::HardEvent::V_S>(kda_chunk::EVENT_V_S);
-    AscendC::WaitFlag<AscendC::HardEvent::V_S>(kda_chunk::EVENT_V_S);
-    for (uint32_t r = 0; r < BT; ++r) {
-        for (uint32_t c = 0; c <= r; ++c) {
-            maskLocal.SetValue(r * BT + c, 1.0f);
-        }
-    }
-    AscendC::SetFlag<AscendC::HardEvent::S_V>(kda_chunk::EVENT_S_V);
-    AscendC::WaitFlag<AscendC::HardEvent::S_V>(kda_chunk::EVENT_S_V);
 }
 
 // ── One (sequence, head) ──────────────────────────────────────────────
 //
-// The reference's `for seq in range(B)` and its head axis collapse into the
-// block index, head minor. Its chunk loop stays a loop: the state carries
-// across chunks, so they are serial.
-//
-// The AIV does everything elementwise and the AIC everything with a matmul in
-// it; they alternate through the chunk, handshaking in mode 2 (AIC <-> both
-// AIVs of one block) with the vector results passed through this block's
-// workspace slice. Only subBlockIdx 0 does the vector work — the stages are
-// too tangled by the gate rebasing to split across the pair, and the second
-// AIV would need its own UB copy of the whole chunk.
+// The reference's sequence and head axes collapse into the block index, head
+// minor; its chunk loop stays a loop because the state carries across
+// chunks. The AIV does everything elementwise and the AIC every matmul,
+// alternating through the chunk via this block's workspace slice.
 template <bool TRACK_STATE>
 __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::Process()
 {
@@ -537,16 +442,9 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::Process()
 
 // ── one bf16 [rows, D] tensor, staged and cast to fp32 ───────────────
 //
-// Two half-chunk copies, because the staging tile is half a chunk: the mask
-// and a whole tile do not both fit in UB. Rows are strided by H in GM, so
-// each half is one DataCopy with a row gap of (H-1) rows; blockLen and gaps
-// count 32 B datablocks, and a 128-lane bf16 row is 8 of them.
-//
-// `V_MTE2` is the write-after-read on `stageLocal`: `MTE2_V` orders the Cast
-// after its own copy, but nothing orders the next copy after the Cast has
-// read, and `PipeBarrier<PIPE_V>` only orders V against V. Without it MTE2
-// runs the whole queue ahead and every Cast reads the last copy's rows —
-// measured as all six Casts in `LoadChunk` producing a[32:64].
+// Two half-chunk copies, since the staging tile is half a chunk. `V_MTE2` is
+// the write-after-read on it: without it every Cast reads the last copy's
+// rows. See the md.
 template <bool TRACK_STATE>
 __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::StageCast(
     const AscendC::GlobalTensor<bfloat16_t> &src, uint64_t base,
@@ -579,8 +477,7 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::StageCast(
 //     q_c, k_c, v_c, g_c, beta_c = rearrange(x[:, bos:eos], ...)
 //
 // Rows are strided by H in GM, so each tensor is one DataCopy with a row gap
-// of (H-1) rows. blockLen and gaps count 32 B datablocks: a 128-lane bf16 row
-// is 256 B = 8 blocks.
+// of (H-1) rows.
 template <bool TRACK_STATE>
 __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::LoadChunk(
     uint32_t head, int32_t tok0, uint32_t rows)
@@ -595,8 +492,8 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::LoadChunk(
 
     // ── b_beta = load(p_b) ───────────────────────────────────────────
     //
-    // One bf16 per row, strided by H, so a DataCopy would move one useful
-    // element per datablock; Scalar gathers the chunk instead.
+    // One bf16 per row, strided by H, so Scalar gathers it: a DataCopy would
+    // move one useful element per datablock.
     for (uint32_t r = 0; r < rows; ++r) {
         const uint64_t bRow =
             static_cast<uint64_t>(tok0 + r) * numHeads_ + head;
@@ -614,10 +511,8 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::LoadChunk(
 //     beta = sigmoid(b)
 //     g_c = g.cumsum(-2)
 //
-// `kda_pre_torch`, for the whole chunk at once. The reference's association is
-// kept: the reduction folds the two 64-lane halves before reducing, and the
-// reciprocal and square root run on Scalar, both of which the recurrent
-// kernels found to be bit-exactness requirements.
+// `kda_pre_torch`, for the whole chunk at once. The reference's association
+// is kept; the md lists the four places that is load-bearing.
 template <bool TRACK_STATE>
 __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::PrepareFactors(
     uint32_t head, uint32_t rows)
@@ -636,8 +531,8 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::PrepareFactors(
 
     // ── the two L2 norms ─────────────────────────────────────────────
     //
-    // `tl.sum` over 128 fp32 lanes folds the halves elementwise and only then
-    // reduces; a plain 2x64 WholeReduceSum pair does not match it.
+    // `tl.sum` folds the two 64-lane halves before reducing; a plain 2x64
+    // WholeReduceSum pair does not match it.
     AscendC::Mul(tmpLocal, qnLocal, qnLocal, rows * D);
     AscendC::PipeBarrier<PIPE_V>();
     ReduceRows128_AS<config::BT>(tmpLocal, redLocal, nrmLocal);
@@ -650,8 +545,7 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::PrepareFactors(
     // One Scalar visit for the chunk: beta's reciprocal and both square roots.
     for (uint32_t r = 0; r < rows; ++r) {
         betaLocal.SetValue(r, 1.0f / brawLocal.GetValue(r));
-        // Scalar sqrt, not Vector: `Sqrt` and `Div` are 1 ulp on this
-        // hardware. The epsilon goes inside, as the reference places it.
+        // Scalar sqrt: Vector `Sqrt`/`Div` are 1 ulp on this hardware.
         const float qs = sqrt(nrmLocal.GetValue(r) + 1e-6f);
         const float ks = sqrt(nrmLocal.GetValue(config::BT + r) + 1e-6f);
         nrmLocal.SetValue(r, scale_ / qs);
@@ -660,8 +554,7 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::PrepareFactors(
     AscendC::SetFlag<AscendC::HardEvent::S_V>(kda_chunk::EVENT_S_V);
     AscendC::WaitFlag<AscendC::HardEvent::S_V>(kda_chunk::EVENT_S_V);
 
-    // Broadcast each row's factor across its 128 lanes, then scale. A row at
-    // a time because the factor is per row and Muls takes a scalar.
+    // A row at a time: the factor is per row and Muls takes a scalar.
     for (uint32_t r = 0; r < rows; ++r) {
         AscendC::Muls(qnLocal[r * D], qnLocal[r * D],
                       nrmLocal.GetValue(r), D);
@@ -692,8 +585,8 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::PrepareFactors(
     AscendC::PipeBarrier<PIPE_V>();
     AscendC::Adds(gcLocal, gcLocal, 1.0f, rows * D);
     AscendC::PipeBarrier<PIPE_V>();
-    // lower_bound / (...), as a real division to match the reference. `lbLocal`
-    // holds the numerator broadcast over a row.
+    // A real division, to match the reference; `lbRowLocal` is the numerator
+    // broadcast over a row.
     for (uint32_t r = 0; r < rows; ++r) {
         AscendC::Div(gcLocal[r * D], lbRowLocal, gcLocal[r * D], D);
     }
@@ -701,8 +594,7 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::PrepareFactors(
 
     // ── g_c = g.cumsum(-2) ───────────────────────────────────────────
     //
-    // Along the token axis, so each row adds the row above it. Serial in the
-    // row index; 63 adds of 128 lanes.
+    // Along the token axis: each row adds the row above it, serially.
     for (uint32_t r = 1; r < rows; ++r) {
         AscendC::Add(gcLocal[r * D], gcLocal[r * D], gcLocal[(r - 1) * D], D);
         AscendC::PipeBarrier<PIPE_V>();
@@ -715,13 +607,12 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::PrepareFactors(
 //
 // written so the Cube can compute it:
 //
-//     row[r,k] = kn[r,k] exp(gc[r,k] - m[k])      per 16-row block
+//     row[r,k] = kn[r,k] exp(gc[r,k] - m[k])      per rebase block
 //     col[c,k] = kn[c,k] exp(m[k] - gc[c,k])      same m
 //     A[r, c] = sum_k row[r,k] col[c,k]
 //
-// with m = gc of the block's last row. The product reconstructs the
-// reference's exponent exactly; the rebase is what keeps both halves inside
-// fp32. `kWsRowQ` is the same thing with qn, for Aqk.
+// m is gc of the block's midpoint row; see `kRebaseRows`. `kWsRowQ` is the
+// same thing with qn, for Aqk.
 template <bool TRACK_STATE>
 __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::WriteRebased(uint32_t rows)
 {
@@ -733,35 +624,40 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::WriteRebased(uint32_t rows)
     for (uint32_t R = 0; R < NB; ++R) {
         const uint32_t r0 = R * SB;
         const uint32_t r1 = r0 + SB;
-        const uint32_t mRow = (r1 - 1) * D;
+        const uint32_t mRow = (r0 + SB / 2) * D;
 
         // ── row factors: rows [r0, r1) of this block ──────────────────
         //
-        // exp(gc[r] - m), one row at a time. A single strided `Sub` with
-        // src1RepStride 0 would express the broadcast in two instructions
-        // instead of SB, but that form faults the vector core here.
+        // exp(gc[r] - m), one row at a time: the strided broadcast `Sub`
+        // faults the vector core here.
         for (uint32_t r = r0; r < r1; ++r) {
             AscendC::Sub(tmpLocal[r * D], gcLocal[r * D], gcLocal[mRow], D);
         }
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Exp(tmpLocal[r0 * D], tmpLocal[r0 * D], SB * D);
         AscendC::PipeBarrier<PIPE_V>();
-        // The two row factors share exp(gc - m), so it is multiplied into kn
-        // and qn in turn with the product landing in `norm`, the second
-        // working tile.
+        // The two share exp(gc - m), multiplied into kn then qn.
         AscendC::Mul(normLocal[r0 * D], knLocal[r0 * D], tmpLocal[r0 * D],
                      SB * D);
         AscendC::PipeBarrier<PIPE_V>();
-        StoreRows(kWsRowK + r0 * D, normLocal[r0 * D], SB * D);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+        AscendC::DataCopy(Slice(kWsRowK + r0 * D), normLocal[r0 * D], SB * D);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
         AscendC::Mul(normLocal[r0 * D], qnLocal[r0 * D], tmpLocal[r0 * D],
                      SB * D);
         AscendC::PipeBarrier<PIPE_V>();
-        StoreRows(kWsRowQ + r0 * D, normLocal[r0 * D], SB * D);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+        AscendC::DataCopy(Slice(kWsRowQ + r0 * D), normLocal[r0 * D], SB * D);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
 
         // ── column factors: rows [0, r1), the lower-triangular reach ──
         //
-        // exp(m - gc[c]). Written as a whole [r1, D] tile because the matmul
-        // reads it as the B operand in [N, K] orientation.
+        // exp(m - gc[c]), a whole [r1, D] tile: the matmul reads it as B in
+        // [N, K] orientation.
         for (uint32_t c = 0; c < r1; ++c) {
             AscendC::Sub(tmpLocal[c * D], gcLocal[mRow], gcLocal[c * D], D);
         }
@@ -770,65 +666,12 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::WriteRebased(uint32_t rows)
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Mul(tmpLocal, knLocal, tmpLocal, r1 * D);
         AscendC::PipeBarrier<PIPE_V>();
-        StoreRows(kWsColK + R * kTileBT_D, tmpLocal, r1 * D);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+        AscendC::DataCopy(Slice(kWsColK + R * kTileBT_D), tmpLocal, r1 * D);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
     }
-}
-
-// ── the masks and the negation ───────────────────────────────────────
-//
-//     A = A * beta_c[..., None]
-//     A = -A.masked_fill(triu(diagonal=0), 0)
-//     Aqk = Aqk.masked_fill(triu(diagonal=1), 0)
-//
-// The Cube wrote both as full [BT, BT] tiles; everything on or above the
-// diagonal is noise from the padded columns and is zeroed here. Row r keeps
-// r columns of Araw and r+1 of Aqk, so the two differ by one lane.
-template <bool TRACK_STATE>
-__aicore__ inline void KdaVarlenChunk<TRACK_STATE>::MaskAndNegate(
-    uint32_t rows)
-{
-    using namespace kda_chunk;
-    constexpr uint32_t BT = config::BT;
-
-    // ── Araw = -(A * beta).tril(-1) ──────────────────────────────────
-    LoadRows(tmpLocal, kWsA, BT * BT);
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
-    for (uint32_t r = 0; r < rows; ++r) {
-        AscendC::Muls(tmpLocal[r * BT], tmpLocal[r * BT],
-                      -betaLocal.GetValue(r), BT);
-    }
-    AscendC::PipeBarrier<PIPE_V>();
-    // tril(-1): row r keeps columns [0, r). Offsetting the destination by one
-    // row against an unshifted mask gives each row r the mask of row r-1,
-    // which is 1 exactly on [0, r). Row 0 keeps nothing.
-    AscendC::Mul(tmpLocal[BT], tmpLocal[BT], maskLocal, (rows - 1) * BT);
-    AscendC::PipeBarrier<PIPE_V>();
-    AscendC::Duplicate(tmpLocal, 0.0f, BT);
-    AscendC::PipeBarrier<PIPE_V>();
-    // Araw seeds the squaring chain and I + Araw is its first factor.
-    StoreRows(kWsDpow, tmpLocal, BT * BT);
-    AddIdentity(tmpLocal, BT);
-    StoreRows(kWsFactor, tmpLocal, BT * BT);
-
-    // X seeds as the identity, not as I + Araw: the chain's six products are
-    // prod_{s=0..5} (I + Araw^(2^s)) and the s == 0 factor is I + Araw
-    // itself, so seeding X with it applies that factor twice — measured as
-    // exactly 2x on the linear term.
-    AscendC::Duplicate(tmpLocal, 0.0f, BT * BT);
-    AscendC::PipeBarrier<PIPE_V>();
-    AddIdentity(tmpLocal, BT);
-    StoreRows(kWsX, tmpLocal, BT * BT);
-
-    // ── Aqk = Aqk.masked_fill(triu(1), 0) ───────────────────────────
-    //
-    // Keeps the diagonal, so the mask applies unshifted.
-    LoadRows(tmpLocal, kWsAqk, BT * BT);
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
-    AscendC::Mul(tmpLocal, tmpLocal, maskLocal, rows * BT);
-    AscendC::PipeBarrier<PIPE_V>();
-    StoreRows(kWsAqk, tmpLocal, BT * BT);
 }
 
 // ── the right operands of the auxiliary matmuls ──────────────────────
@@ -838,9 +681,8 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::MaskAndNegate(
 //     o = (q_i * g_i.exp()) @ S + ...
 //     S = ... + ((g_i[-1] - g_i).exp() * k_i).T @ v_i
 //
-// `A` is the inverse scaled by beta on the right. Rather than scaling the
-// [BT, BT] inverse, beta is folded into the right operands, which is the same
-// product: (X * beta[None, :]) @ M == X @ (beta[:, None] * M).
+// beta is folded into the right operands rather than scaling the [BT, BT]
+// inverse: (X * beta[None, :]) @ M == X @ (beta[:, None] * M).
 template <bool TRACK_STATE>
 __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::BuildAuxOperands(
     uint32_t head, int32_t tok0, uint32_t rows)
@@ -861,12 +703,20 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::BuildAuxOperands(
                       betaLocal.GetValue(r), D);
     }
     AscendC::PipeBarrier<PIPE_V>();
-    StoreRows(kWsKgBeta, normLocal, rows * D);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+    AscendC::DataCopy(Slice(kWsKgBeta), normLocal, rows * D);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
 
     // q_i * exp(g_i), the output's state term; no beta here
     AscendC::Mul(normLocal, tmpLocal, qnLocal, rows * D);
     AscendC::PipeBarrier<PIPE_V>();
-    StoreRows(kWsQg, normLocal, rows * D);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+    AscendC::DataCopy(Slice(kWsQg), normLocal, rows * D);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
 
     // beta * v_c. v is re-staged here rather than held across the chunk:
     // keeping it resident would need another [64, 128] tile and the UB map
@@ -879,7 +729,11 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::BuildAuxOperands(
                       betaLocal.GetValue(r), D);
     }
     AscendC::PipeBarrier<PIPE_V>();
-    StoreRows(kWsVBeta, normLocal, rows * D);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+    AscendC::DataCopy(Slice(kWsVBeta), normLocal, rows * D);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
 
     // exp(g_i[-1] - g_i) * k_i, the state update's left operand. Its
     // transpose is the operand, which the matmul takes care of.
@@ -892,7 +746,11 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::BuildAuxOperands(
     AscendC::PipeBarrier<PIPE_V>();
     AscendC::Mul(tmpLocal, tmpLocal, knLocal, rows * D);
     AscendC::PipeBarrier<PIPE_V>();
-    StoreRows(kWsKDecay, tmpLocal, rows * D);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+    AscendC::DataCopy(Slice(kWsKDecay), tmpLocal, rows * D);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
 }
 
 // ── v_i, o and the state ─────────────────────────────────────────────
@@ -901,9 +759,7 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::BuildAuxOperands(
 //     o = (q_i * g_i.exp()) @ S + Aqk @ v_i
 //     S = S * g_i[-1].exp() + <state update from the Cube>
 //
-// The Cube left `u`, `w @ S`, the two output terms and the state increment in
-// the workspace; this adds them up, writes the chunk's output rows, and
-// advances the state.
+// Sums the Cube's five results, writes the output rows, advances the state.
 template <bool TRACK_STATE>
 __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::FinishChunk(
     uint32_t head, int32_t tok0, uint32_t rows)
@@ -912,8 +768,12 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::FinishChunk(
     constexpr uint32_t D = config::D;
 
     // ── o = state term + Aqk @ v_i ───────────────────────────────────
-    LoadRows(normLocal, kWsOut, rows * D);
-    LoadRows(tmpLocal, kWsTmpBT_D, rows * D);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+    AscendC::DataCopy(normLocal, Slice(kWsOut), rows * D);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+    AscendC::DataCopy(tmpLocal, Slice(kWsTmpBT_D), rows * D);
     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
     AscendC::Add(normLocal, normLocal, tmpLocal, rows * D);
@@ -949,10 +809,10 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::FinishChunk(
 }
 
 
-// One squaring step's bookkeeping: the Cube wrote X @ (I + D) into the
-// scratch tile and D @ D into the [BT, D] landing tile. Move the product into
-// X and the squared nilpotent part into `kWsDpow`, adding the identity so the
-// next product's operand is (I + D).
+#if KDA_CHUNK_INVERSE_SQUARING
+
+// One squaring step's bookkeeping: move X @ (I + D) into X and D @ D into
+// `kWsDpow`, adding the identity so the next product's operand is (I + D).
 template <bool TRACK_STATE>
 __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::AdvanceInverse(
     uint32_t rows)
@@ -962,17 +822,189 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::AdvanceInverse(
 
     CopyWs(kWsX, kWsScratch, rows * BT);
 
-    // The Cube squared the nilpotent part into the landing tile. Keep it as
-    // `kWsDpow` for the next squaring, and build `I + D` beside it as the
-    // next product's operand.
-    LoadRows(tmpLocal, kWsTmpBT_D, rows * BT);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+    AscendC::DataCopy(tmpLocal, Slice(kWsTmpBT_D), rows * BT);
     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
-    StoreRows(kWsDpow, tmpLocal, rows * BT);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+    AscendC::DataCopy(Slice(kWsDpow), tmpLocal, rows * BT);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
     AddIdentity(tmpLocal, rows);
     AscendC::PipeBarrier<PIPE_V>();
-    StoreRows(kWsFactor, tmpLocal, rows * BT);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+    AscendC::DataCopy(Slice(kWsFactor), tmpLocal, rows * BT);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
 }
+
+#else  // blocked forward substitution
+
+// ── one 32x32 diagonal inverse, by forward substitution ──────────────
+//
+//     for i in range(2, BC):
+//         b_a = -Akk[i, :]  masked to columns [0, i)
+//         b_a += sum_j b_a[j] * b_Ai[j, :]
+//         b_Ai[i, :] = b_a
+//
+// `chunk_kda_fwd_kernel_diag_solve_npu`, on the block at (r0, r0) of the
+// resident Araw tile. The row reduction becomes i-1 `Axpy` calls; the md
+// covers why one Scalar visit per row is enough and why there are no PIPE_V
+// barriers between them.
+template <bool TRACK_STATE>
+__aicore__ inline void KdaVarlenChunk<TRACK_STATE>::SubstituteBlock(
+    uint32_t r0, uint32_t rows)
+{
+    using namespace kda_chunk;
+    constexpr uint32_t BT = config::BT;
+    const uint32_t n = rows < kInvBlock ? rows : kInvBlock;
+
+    // The block is on the diagonal, so its columns start at r0 as well.
+    const uint32_t base = r0 * BT + r0;
+
+    float coeff[kInvBlock];
+    for (uint32_t i = 2; i < n; ++i) {
+        const uint32_t rowI = base + i * BT;
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_V_S);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_V_S);
+        for (uint32_t j = 1; j < i; ++j) {
+            coeff[j] = tmpLocal.GetValue(rowI + j);
+        }
+        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_S_V);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_S_V);
+        // Row j is nonzero only on [0, j), so each covers j lanes.
+        for (uint32_t j = 1; j < i; ++j) {
+            AscendC::Axpy(tmpLocal[rowI], tmpLocal[base + j * BT], coeff[j],
+                          j);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+}
+
+// ── the worker AIV's share: C00, and the Cube's operands ─────────────
+//
+// Publishes B10 (the Cube's operand) and B11 (the helper's block), solves
+// C00, and leaves rows [0, 32) of `kWsX` in their final form.
+template <bool TRACK_STATE>
+__aicore__ inline void KdaVarlenChunk<TRACK_STATE>::SolveDiagBlocks(
+    uint32_t rows)
+{
+    using namespace kda_chunk;
+    constexpr uint32_t BT = config::BT;
+    constexpr uint32_t NB = kInvBlock;
+
+    // Reload Araw: the seeding block stored it to kWsDpow, but tmpLocal was
+    // subsequently overwritten by the Aqk masking step.
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_V_MTE2);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_V_MTE2);
+    AscendC::DataCopy(tmpLocal, Slice(kWsDpow), BT * BT);
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
+
+    // ── B10 and B11, published before either is solved ───────────────
+    //
+    // Both packed, B11 because the helper has no UB copy of the chunk. B10
+    // is already negated, so the Cube's +C11 B10 C00 is the reference's
+    // -C11 Akk10 C00.
+    StoreBlock(kWsInvB10, tmpLocal[NB * BT], NB, NB, BT);
+    StoreBlock(kWsInvB11, tmpLocal[NB * BT + NB], NB, NB, BT);
+    AscendC::CrossCoreSetFlag<0x1, PIPE_MTE3>(kFlagAivToAiv);
+    AscendC::CrossCoreWaitFlag(kFlagAivToAiv);
+
+    // ── C00, solved here while the helper solves C11 ──────────────────
+    SubstituteBlock(0, rows);
+    AddIdentity(tmpLocal, NB);
+
+    // ── rows [0, 32) of kWsX = [ C00 | 0 ] ───────────────────────────
+    //
+    // C00 is already in place; this clears (0, 32), which still holds Araw's
+    // masked-out noise and which the auxiliary matmuls would read.
+    for (uint32_t i = 0; i < NB; ++i) {
+        AscendC::Duplicate(tmpLocal[i * BT + NB], 0.0f, NB);
+    }
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+    AscendC::DataCopy(Slice(kWsX), tmpLocal, NB * BT);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+}
+
+// ── the helper AIV's share: C11 ──────────────────────────────────────
+//
+// Reads B11 back from the workspace into (0, 32) of its own `tmp`, where
+// that block sits in the [BT, BT] layout, and leaves rows [32, 64) of
+// `kWsX` less the C10 hole the Cube fills.
+template <bool TRACK_STATE>
+__aicore__ inline void KdaVarlenChunk<TRACK_STATE>::SolveDiagBlockHelper()
+{
+    using namespace kda_chunk;
+    constexpr uint32_t BT = config::BT;
+    constexpr uint32_t NB = kInvBlock;
+
+    AscendC::CrossCoreSetFlag<0x1, PIPE_MTE3>(kFlagAivToAiv);
+    AscendC::CrossCoreWaitFlag(kFlagAivToAiv);
+
+    // B11 into (0, 32) of a BT-wide tile: 32 rows of 32, strided by BT.
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_V_MTE2);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_V_MTE2);
+    {
+        AscendC::DataCopyParams p{
+            static_cast<uint16_t>(NB),
+            static_cast<uint16_t>(NB * sizeof(float) / 32),
+            0,
+            static_cast<uint16_t>((BT - NB) * sizeof(float) / 32)};
+        AscendC::DataCopy(tmpLocal[NB], Slice(kWsInvB11), p);
+    }
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
+
+    // The C10 hole; the Cube overwrites it, so this is only to keep the
+    // store from carrying garbage.
+    for (uint32_t i = 0; i < NB; ++i) {
+        AscendC::Duplicate(tmpLocal[i * BT], 0.0f, NB);
+    }
+    AscendC::PipeBarrier<PIPE_V>();
+
+    // `SubstituteBlock`'s loop with the block at (0, 32) rather than on the
+    // diagonal, so its (r0, r0) anchor does not apply.
+    float coeff[kInvBlock];
+    for (uint32_t i = 2; i < NB; ++i) {
+        const uint32_t rowI = i * BT + NB;
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_V_S);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_V_S);
+        for (uint32_t j = 1; j < i; ++j) {
+            coeff[j] = tmpLocal.GetValue(rowI + j);
+        }
+        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_S_V);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_S_V);
+        for (uint32_t j = 1; j < i; ++j) {
+            AscendC::Axpy(tmpLocal[rowI], tmpLocal[j * BT + NB], coeff[j], j);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    // The identity, on a diagonal starting at column NB.
+    AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_V_S);
+    AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_V_S);
+    for (uint32_t r = 0; r < NB; ++r) {
+        const uint32_t i = r * BT + NB + r;
+        tmpLocal.SetValue(i, tmpLocal.GetValue(i) + 1.0f);
+    }
+    AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_S_MTE3);
+    AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_S_MTE3);
+
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+    AscendC::DataCopy(Slice(kWsX + NB * BT), tmpLocal, NB * BT);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+}
+
+#endif  // KDA_CHUNK_INVERSE_SQUARING
 
 // exp(g_c[r-1] - g_c) * k_c over the first `r` rows: the state update's left
 // operand, rebased on row r-1 instead of the chunk's last row. `r == rows`
@@ -992,17 +1024,20 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::RebaseKDecay(uint32_t r)
     AscendC::PipeBarrier<PIPE_V>();
     AscendC::Mul(tmpLocal, tmpLocal, knLocal, r * D);
     AscendC::PipeBarrier<PIPE_V>();
-    StoreRows(kWsKDecay, tmpLocal, r * D);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+    AscendC::DataCopy(Slice(kWsKDecay), tmpLocal, r * D);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
 }
 
 // ── S = S * g_c[refRow].exp() + increment ────────────────────────────
 //
 //     S = S * g_i[-1].exp()[:, None] + <increment>
 //
-// The decay is indexed by the key axis, which in the transposed tile is the
-// column, so each [V, K] row takes the whole exp(g_c[refRow]) vector as an
-// elementwise multiplier. One row at a time: the tile is 64 KB and no UB
-// buffer here is larger than 32 KB.
+// The decay is indexed by the key axis, the column in the transposed tile,
+// so each [V, K] row takes the whole vector. One row at a time: the tile is
+// 64 KB and no UB buffer here is larger than 32 KB.
 template <bool TRACK_STATE>
 __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::ApplyStateUpdate(
     uint32_t refRow, uint32_t rows)
@@ -1014,28 +1049,33 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::ApplyStateUpdate(
     AscendC::Exp(normLocal, gcLocal[refRow * D], D);
     AscendC::PipeBarrier<PIPE_V>();
 
-    // The two [D] landing buffers are rows of `tmp`, not `qn`/`kn`: the
-    // tracked-prefix path calls this and then `RebaseKDecay`, which still
-    // needs `kn`.
+    // Rows of `tmp`, not `qn`/`kn`: the tracked-prefix path calls this and
+    // then `RebaseKDecay`, which still needs `kn`.
     auto accLocal = tmpLocal;
     auto incLocal = tmpLocal[D];
     for (uint32_t row = 0; row < D; ++row) {
-        LoadRows(accLocal, kWsState + row * D, D);
-        LoadRows(incLocal, kWsStateUpd + row * D, D);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+        AscendC::DataCopy(accLocal, Slice(kWsState + row * D), D);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+        AscendC::DataCopy(incLocal, Slice(kWsStateUpd + row * D), D);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
         AscendC::Mul(accLocal, accLocal, normLocal, D);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Add(accLocal, accLocal, incLocal, D);
         AscendC::PipeBarrier<PIPE_V>();
-        StoreRows(kWsState + row * D, accLocal, D);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+        AscendC::DataCopy(Slice(kWsState + row * D), accLocal, D);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
     }
 }
 
-// S -> initial_state_source[slot, head]. The pool slot is [K, V] with K
-// contiguous, i.e. [V][K] in memory, which is how `kWsState` holds it, so the
-// copy is verbatim. This block owns the whole head, so no other block shares
-// a datablock.
+// S -> initial_state_source[slot, head]. Verbatim: the pool slot is [V][K]
+// in memory, which is the orientation `kWsState` keeps.
 template <bool TRACK_STATE>
 __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::CopyStateOut(
     uint32_t slot, uint32_t head)
@@ -1045,7 +1085,9 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::CopyStateOut(
     const uint64_t pstate =
         (static_cast<uint64_t>(slot) * numHeads_ + head) * D * D;
     for (uint32_t row = 0; row < D; ++row) {
-        LoadRows(tmpLocal, kWsState + row * D, D);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+        AscendC::DataCopy(tmpLocal, Slice(kWsState + row * D), D);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_V_MTE3);
@@ -1056,9 +1098,8 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::CopyStateOut(
     }
 }
 
-// Undo a tracked-prefix state update: the chunk's own update has to run from
-// the state as it was at the chunk's start, so the prefix version is computed
-// into a copy and the original put back from `kWsStateUpd`'s companion.
+// Undo a tracked-prefix state update: the chunk's own has to run from the
+// state as it was at the chunk's start.
 template <bool TRACK_STATE>
 __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::RestoreState()
 {
@@ -1086,13 +1127,13 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::CopyWs(
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_MTE3_V);
     }
     // `tmp` is the staging buffer, so the caller's next Vector write to it
-    // has to wait for the last store to have read it.
+    // waits for the last store to have read it.
     AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_MTE3_V);
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_MTE3_V);
 }
 
-// The AIV's half: everything elementwise, in the order the Cube needs it, with
-// a handshake at each boundary. One chunk per pass of the loop.
+// The AIV's half: everything elementwise, in the order the Cube needs it,
+// with a handshake at each boundary. One chunk per pass of the loop.
 template <bool TRACK_STATE>
 __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::RunAiv()
 {
@@ -1100,9 +1141,8 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::RunAiv()
     constexpr uint32_t D = config::D;
     constexpr uint32_t BT = config::BT;
 
-    // On an AIV, `GetBlockIdx()` is a global AIV index (0 .. 2*blockDim-1),
-    // not the Cube block: the two AIVs of block b report 2b and 2b+1. The
-    // block is therefore the index halved, and only subBlockIdx 0 works.
+    // `GetBlockIdx()` on an AIV is a global AIV index (0 .. 2*blockDim-1),
+    // not the Cube block, so the block is the index halved.
     const uint32_t aivIdx = AscendC::GetBlockIdx();
     const uint32_t blockIdx = aivIdx / 2;
     const uint32_t head = blockIdx % numHeads_;
@@ -1126,11 +1166,12 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::RunAiv()
         }
     }
 
-    if (worker) {
-        AscendC::InitSocState();
+    // Both AIVs: it sets the vector mask to all-ones, and the helper runs
+    // vector work of its own under the substitution inverse.
+    AscendC::InitSocState();
 
+    if (worker) {
         // ── b_dt_bias, and lower_bound as a tensor for the gate's Div ──
-        BuildMask();
         AscendC::DataCopy(biasLocal, dtBiasGm[head * D], D);
         AscendC::Duplicate(lbRowLocal, lowerBound_, D);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
@@ -1153,7 +1194,11 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::RunAiv()
                 AscendC::Duplicate(tmpLocal, 0.0f, D);
                 AscendC::PipeBarrier<PIPE_V>();
             }
-            StoreRows(kWsState + row * D, tmpLocal, D);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+            AscendC::DataCopy(Slice(kWsState + row * D), tmpLocal, D);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
         }
 
         // ── track_len == 0 writes the initial state ───────────────────
@@ -1178,15 +1223,89 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::RunAiv()
         AscendC::CrossCoreWaitFlag(kFlagAicToAiv);
 
         if (worker) {
-            MaskAndNegate(rows);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+            // ── the masks and the negation ───────────────────────────────────────
+            //
+            //     A = A * beta_c[..., None]
+            //     A = -A.masked_fill(triu(diagonal=0), 0)
+            //     Aqk = Aqk.masked_fill(triu(diagonal=1), 0)
+            //
+            // ── Araw = -(A * beta).tril(-1) ──────────────────────────────────
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+            AscendC::DataCopy(tmpLocal, Slice(kWsA), BT * BT);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
+            for (uint32_t r = 0; r < rows; ++r) {
+                AscendC::Muls(tmpLocal[r * BT], tmpLocal[r * BT],
+                              -betaLocal.GetValue(r), BT);
+            }
+            AscendC::PipeBarrier<PIPE_V>();
+            // tril(-1): zero [r, BT) on row r.
+            for (uint32_t r = 0; r < rows; ++r) {
+                uint64_t mask[2] = { ~((1ULL << r) - 1ULL), 0ULL };
+                AscendC::Duplicate<float>(tmpLocal[r * BT], 0.0f, mask, 1, 1, 1);
+            }
+            AscendC::ResetMask();
+
+            // Araw: the squaring chain's seed, and the tile the substitution
+            // path's `SolveDiagBlocks` reloads. The substitution path seeds
+            // nothing else — the identity enters inside each diagonal solve,
+            // and both halves of kWsX are written in full before the Cube
+            // reads it.
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+            AscendC::DataCopy(Slice(kWsDpow), tmpLocal, BT * BT);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+
+#if KDA_CHUNK_INVERSE_SQUARING
+            // I + Araw is the chain's first factor.
+            AddIdentity(tmpLocal, BT);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+            AscendC::DataCopy(Slice(kWsFactor), tmpLocal, BT * BT);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+
+            // X seeds as the identity, not as I + Araw: that factor is the chain's
+            // s == 0 product and seeding X with it applies it twice.
+            AscendC::Duplicate(tmpLocal, 0.0f, BT * BT);
+            AscendC::PipeBarrier<PIPE_V>();
+            AddIdentity(tmpLocal, BT);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+            AscendC::DataCopy(Slice(kWsX), tmpLocal, BT * BT);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+#endif
+
+            // ── Aqk = Aqk.masked_fill(triu(1), 0) ───────────────────────────
+            //
+            // Last, because it overwrites the Araw the seeding above needs.
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+            AscendC::DataCopy(tmpLocal, Slice(kWsAqk), BT * BT);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
+            // Aqk triu(1): zero [r+1, BT) on row r.
+            for (uint32_t r = 0; r + 1 < rows; ++r) {
+                uint64_t mask[2] = { ~((1ULL << (r + 1)) - 1ULL), 0ULL };
+                AscendC::Duplicate<float>(tmpLocal[r * BT], 0.0f, mask, 1, 1, 1);
+            }
+            AscendC::ResetMask();
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+            AscendC::DataCopy(Slice(kWsAqk), tmpLocal, BT * BT);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
         }
 
+#if KDA_CHUNK_INVERSE_SQUARING
         // ══ the inverse: 6 squaring steps on the Cube ═══════════════════
         //
         // Between steps the AIV turns the Cube's two results back into the
-        // next step's operands: X <- X @ (I + D) is already in the scratch
-        // tile, and D <- D^2 needs the identity added before the next
-        // product.
+        // next step's operands.
         for (uint32_t s = 0; s < kInverseSteps; ++s) {
             AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(kFlagAivToAic);
             AscendC::CrossCoreWaitFlag(kFlagAicToAiv);
@@ -1206,16 +1325,54 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::RunAiv()
         // ══ w, u, w @ S ════════════════════════════════════════════════
         AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(kFlagAivToAic);
         AscendC::CrossCoreWaitFlag(kFlagAicToAiv);
+#else
+        // ══ the inverse: two 32x32 substitutions, then one Cube pair ════
+        //
+        //     C00, C11  forward substitution, one block per AIV
+        //     C10 = -C11 B10 C00, two Cube matmuls
+        //
+        // One AIV -> AIC handoff, and no reply: the AIV goes straight on to
+        // the auxiliary operands, which the Cube's two inversion matmuls
+        // then overlap. See the md for why, and for the measurements.
+        if (worker) {
+            SolveDiagBlocks(rows);
+        } else {
+            SolveDiagBlockHelper();
+        }
+        // Mode 2 is a quorum: the AIC's wait clears only once *both* AIVs have
+        // set this ID, so this one Set per core is what orders C00 and C11
+        // against the Cube's C10 pair. Both AIVs must reach it unconditionally.
+        AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(kFlagAivToAic);
+
+        if (worker) {
+            BuildAuxOperands(head, tok0, rows);
+        }
+
+        // ══ w, u, w @ S ════════════════════════════════════════════════
+        //
+        // The aux ID, so the Cube takes the two forward messages in order
+        // without the inversion needing a reply to close its pair.
+        AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(kFlagAivToAicAux);
+        AscendC::CrossCoreWaitFlag(kFlagAicToAiv);
+#endif
 
         if (worker) {
             // v_i = u_i - w_i @ S
-            LoadRows(normLocal, kWsU, rows * D);
-            LoadRows(tmpLocal, kWsTmpBT_D, rows * D);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+            AscendC::DataCopy(normLocal, Slice(kWsU), rows * D);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(kda_chunk::EVENT_V_MTE2);
+            AscendC::DataCopy(tmpLocal, Slice(kWsTmpBT_D), rows * D);
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_MTE2_V);
             AscendC::Sub(normLocal, normLocal, tmpLocal, rows * D);
             AscendC::PipeBarrier<PIPE_V>();
-            StoreRows(kWsVNew, normLocal, rows * D);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kda_chunk::EVENT_V_MTE3);
+            AscendC::DataCopy(Slice(kWsVNew), normLocal, rows * D);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(kda_chunk::EVENT_MTE3_V);
         }
 
         // ══ o's two terms and the state increment ══════════════════════
@@ -1230,9 +1387,8 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::RunAiv()
         //
         //     if i*BT < track_len <= (i+1)*BT
         //
-        // The AIV rebuilds `kWsKDecay` against row r-1 instead of the last
-        // row, the Cube redoes the increment over r rows, and the result is
-        // the state after `track_len` tokens.
+        // The AIV rebuilds `kWsKDecay` against row r-1 and the Cube redoes
+        // the increment over r rows.
         if constexpr (TRACK_STATE) {
             const int32_t consumed = tok0 - bos;
             if (trackIndex > 0 && consumed < trackLen &&
@@ -1301,11 +1457,8 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::RunAic()
         //     A[..., i] = einsum(k_c * (g_c - g_i).exp(), k_i)
         //     Aqk[..., j] = einsum(q_i * (g_i - g_j).exp(), k_j)
         //
-        // One matmul per 16-row rebase block, over columns [0, r1): the row
-        // factor is rebased on that block's last row and the column factor on
-        // the same m, so the product reconstructs the reference's pairwise
-        // exponent exactly. Columns past r1 are above the diagonal and the
-        // AIV masks them.
+        // One matmul per rebase block, over columns [0, r1). Columns past r1
+        // are above the diagonal and the AIV masks them.
         AscendC::CrossCoreWaitFlag(kFlagAivToAic);
         for (uint32_t R = 0; R < NB; ++R) {
             const uint32_t r0 = R * SB;
@@ -1326,6 +1479,7 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::RunAic()
         //     for i in range(1, BT):
         //         A[..., i, :i] += (A[..., i, :, None] * A[..., :, :i]).sum(-2)
         //     A = A + eye(BT)
+#if KDA_CHUNK_INVERSE_SQUARING
         //
         // Repeated squaring instead of that substitution: Araw is strictly
         // lower triangular so Araw^BT == 0, and every k < BT has a unique
@@ -1346,6 +1500,30 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::RunAic()
             }
             AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(kFlagAicToAiv);
         }
+#else
+        //
+        //     b_Ai10 = -dot(dot(b_Ai11, b_Akk10), b_Ai00)
+        //
+        // `chunk_kda_fwd_kernel_inter_solve_fused_npu`'s off-diagonal merge.
+        // C00 and C11 are read in place out of `kWsX` and C10 lands in its
+        // hole, hence the BT pitches; B10 arrives negated, so no sign flip.
+        constexpr uint32_t NB = kInvBlock;
+        // One wait: the mode-2 quorum already means both AIVs have stored
+        // their half of kWsX before this clears.
+        AscendC::CrossCoreWaitFlag(kFlagAivToAic);
+        // C11 @ B10 — C11 at (32, 32) of kWsX, B10 packed
+        CubeMatmul<false, false>(Slice(kWsX + NB * BT + NB),
+                                 Slice(kWsInvB10), Slice(kWsInvTmp),
+                                 NB, NB, NB, 0, false, BT, 0);
+        // kWsInvTmp is the first matmul's Fixpipe output and the second's MTE2
+        // input; CubeMatmul's internal barriers order on-chip buffers only.
+        AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE2>(EVENT_ID0);
+        // (C11 B10) @ C00, into the hole at (32, 0) of kWsX
+        CubeMatmul<false, false>(Slice(kWsInvTmp), Slice(kWsX),
+                                 Slice(kWsX + NB * BT), NB, NB, NB, BT,
+                                 false, 0, BT);
+#endif
 
         // ══ AUXILIARIES, OUTPUT, STATE ══════════════════════════════════
         //
@@ -1355,9 +1533,15 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::RunAic()
         //     o = (q_i * g_i.exp()) @ S + Aqk @ v_i
         //     S = S * g_i[-1].exp() + ((g_i[-1] - g_i).exp() * k_i).T @ v_i
         //
-        // `A` here is the inverse scaled by beta on the right, which the AIV
-        // folds into the right operand instead: Ainv @ M == X @ (beta * M).
+        // `A` is the inverse scaled by beta on the right, which the AIV
+        // folds into the right operand: Ainv @ M == X @ (beta * M).
+#if KDA_CHUNK_INVERSE_SQUARING
         AscendC::CrossCoreWaitFlag(kFlagAivToAic);
+#else
+        // The aux ID: the inversion's handoff came in on `kFlagAivToAic` and
+        // was not replied to, so this is the second forward message.
+        AscendC::CrossCoreWaitFlag(kFlagAivToAicAux);
+#endif
         CubeMatmul<false, false>(Slice(kWsX), Slice(kWsKgBeta),
                                  Slice(kWsW), BT, D, BT);
         CubeMatmul<false, false>(Slice(kWsX), Slice(kWsVBeta),
@@ -1377,8 +1561,6 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::RunAic()
                                  Slice(kWsTmpBT_D), BT, D, BT);
         // The state increment, transposed to match S:
         //     (kdecay.T @ vnew).T == vnew.T @ kdecay
-        // Both operands are stored [BT, D], so the left one takes the A_TRANS
-        // route and the right goes in as-is.
         CubeMatmul<true, false>(Slice(kWsVNew), Slice(kWsKDecay),
                                 Slice(kWsStateUpd), D, D, BT);
         AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(kFlagAicToAiv);
@@ -1415,10 +1597,8 @@ __aicore__ inline void KdaVarlenChunk<TRACK_STATE>::RunAic()
 
 // ── Entry points ──────────────────────────────────────────────────────
 //
-// Two kernels differing only in `TRACK_STATE`, a template parameter rather
-// than a runtime flag because it changes what the chunk loop does at a chunk
-// boundary. The macro exists because a `__global__` kernel cannot be a
-// template and the signature has to match the launcher exactly.
+// Two kernels differing only in `TRACK_STATE`. The macro exists because a
+// `__global__` kernel cannot be a template.
 #define KDA_CHUNK_KERNEL(NAME, TRACK)                                   \
 extern "C" __global__ __aicore__                                        \
 void NAME(                                                              \

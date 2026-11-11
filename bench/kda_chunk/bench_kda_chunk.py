@@ -24,10 +24,17 @@ mechanism. See ``ref_ops/AGENTS.md``.
 Inputs follow ``bench_kda_varlen_recurrent.py``'s ``make_case`` exactly: same
 shapes, same dtypes, same distributions, same native state-pool layout. The two
 benchmarks measure the two halves of the same deployed prefill, so a shape that
-disagreed between them would make the comparison meaningless. The chunk
-operators want TND and pre-normalized q/k, which ``prepare_tnd`` derives inside
-each arm rather than in ``make_inputs`` -- see its docstring for why that
-belongs in the timed region.
+disagreed between them would make the comparison meaningless.
+
+Every arm is called with those inputs *raw* and unmodified: rank-4
+``[1, T, H, D]`` as ``BSND``, un-normalized q/k, raw gate, raw beta logits, and
+the state pool in its own K-contiguous orientation. ``ascendc`` and ``fla`` fuse
+all of the preparation; ``cann``'s operator has no L2-norm or beta-sigmoid
+attribute to fuse it with, so that one arm does those two steps on the host
+inside its timed region. ``FUSION`` records the difference and the table prints
+it -- the alternative, preparing on the host for everyone, charged the two
+reference arms for work the target does on-chip and understated them by up to
+24%.
 """
 
 from __future__ import annotations
@@ -141,9 +148,10 @@ class Inputs:
 
     ``q``/``k``/``v``/``a`` are ``[1, T, H, D]`` and ``b`` is ``[1, T, H]``,
     which is the caller's packed-prefill shape and the shape
-    ``bench_kda_varlen_recurrent.py`` measures. ``a`` is the *raw* gate and
-    ``b`` the *raw* beta: the activation and the sigmoid happen downstream, in
-    the kernel or in ``prepare_tnd``, never here.
+    ``bench_kda_varlen_recurrent.py`` measures. Every arm takes them at this
+    rank, as ``BSND``. ``a`` is the *raw* gate and ``b`` the *raw* beta: the
+    activation and the sigmoid happen downstream, in the kernel wherever the
+    operator can do it, never here.
 
     ``dt_bias`` is flat ``[HV*K]``: the form both reference arms require, and
     the form the Triton recurrence indexes as ``i_hv * K + o_k``.
@@ -344,63 +352,80 @@ def make_inputs(
 # --- the arms, and the anchor they are checked against --------------------
 #
 # Every arm returns (attn_out, final_state): attn_out as [T, HV, V] in the input
-# dtype, final_state as fp32 [N, HV, K, V]. Verified for both reference arms --
-# they return exactly that, and `final_state` comes back in the same K/V
-# orientation as the state pool, not transposed.
+# dtype, final_state as fp32 [N, HV, K, V].
+#
+# Every arm also *carries* its state in the one layout the Ascend C op accepts
+# -- the pool's own, K fastest, which the reference ops spell `state_v_first`.
+# That is the orientation `native_state` allocates and the orientation the
+# deployed backend normalizes both of its pools to, so it is the only one in
+# which all four arms are handed the bytes the kernel reads. Before this, the
+# reference arms were gathered into a contiguous [N, HV, K, V] instead, which
+# fed them a transposed copy of the pool rather than the pool.
+#
+# This is a layout correctness point, not a speed one: the repack measured
+# 0.025 ms per call at H8 against medians of 1-7 ms, and removing it moved no
+# arm outside its MAD. It is worth having because the pool orientation is
+# exactly the kind of thing the two reference kernels could have specialized
+# on -- `state_v_first` is a tiling attribute, not a host-side transpose -- and
+# an arm reading a layout the deployment never produces is measuring the wrong
+# kernel path for free.
 
 
-def prepare_tnd(inputs: Inputs):
-    """``(q, k, v, g, beta, initial_state)`` as the chunk operators want them.
+def native_live_state(state: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    """``state``'s live slots as the contiguous ``[N, HV, V, K]`` it already is.
 
-    Two conversions, both of which the deployed prefill also performs:
+    ``native_state`` allocates ``[slots, HV, V, K]`` and views it
+    ``[slots, HV, K, V]``, so ``K`` is the fastest axis. That orientation is
+    what the Ascend C op requires and checks for, and it is what the reference
+    ops call ``state_v_first``: a contiguous ``[N, HV, V, K]``. Gathering
+    through the V-first view is therefore a plain slice copy of the bytes the
+    kernel reads, where gathering a contiguous ``[N, HV, K, V]`` -- which is
+    what indexing the pool's own view produces -- hands the operator a
+    transposed copy of the pool instead of the pool.
 
-    * **Squeeze to TND.** The operators take ``[T, H, D]`` for a packed
-      sequence. Passing a ``[1, T, H, D]`` tensor as BSND would read ``T`` as
-      the batch -- the same trap the recurrence benchmark records for
-      ``recurrent_kda``.
-    * **L2-normalize q/k and sigmoid beta, in fp32.** This is what
-      ``_prepare_inputs`` does upstream before the recurrence, and it is not
-      optional here: the ``ref_ops`` CANN bridge exposes no
-      ``use_qk_l2norm_in_kernel`` flag, and ``fla``'s in-kernel path refuses
-      every chunk size but 64. Doing it on the host is therefore the only form
-      both arms can be measured in, and the only form in which they are
-      measuring the same thing.
-
-    The gate stays raw: ``A_log``, ``dt_bias`` and the bounded sigmoid are
-    applied inside the kernel under ``use_gate_in_kernel``, which is how the
-    deployment runs it.
-
-    Called inside each arm, not hoisted into ``make_inputs``, because the
-    preparation is work the deployed path does per call -- so it belongs in the
-    timed region of any arm that needs it, and the target is free to fuse it
-    and be credited for that.
+    Only the two reference arms need this. ``ascendc`` and ``run_torch`` take
+    the pool itself and write their state back into it, so they read their
+    result out as a strided view and convert nothing.
     """
-    q, k = inputs.q.float(), inputs.k.float()
-    q = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6)
-    k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
-    return (
-        q.bfloat16().squeeze(0),
-        k.bfloat16().squeeze(0),
-        inputs.v.squeeze(0),
-        inputs.a.squeeze(0),
-        torch.sigmoid(inputs.b.float()).squeeze(0),
-        # Gather the live slots into the [N, HV, K, V] contiguous fp32 tensor
-        # the operators take. The pool itself is a strided view and is not
-        # written by these arms -- the chunk ops return the final state rather
-        # than updating in place, which is the other half of why this benchmark
-        # and the recurrence one cannot share a single call convention.
-        inputs.state[inputs.indices.long()].contiguous(),
-    )
+    return state.transpose(-1, -2)[indices.long()].contiguous()
+
+
+def k_first(final_state: torch.Tensor) -> torch.Tensor:
+    """A V-first state back in the ``[N, HV, K, V]`` arm contract.
+
+    A transpose, so a view rather than a copy: the bytes are already the
+    pool's, and the arms only differ in which axis they call last.
+    """
+    return final_state.transpose(-1, -2)
+
+
+def host_l2norm(q: torch.Tensor, k: torch.Tensor):
+    """``q``/``k`` L2-normalized in fp32, rank preserved.
+
+    ``kda_pre_torch``'s formula, kept to its association: the epsilon is inside
+    the square root, and the reduction is a plain ``sum`` over the last axis.
+
+    Only ``cann`` calls this. Its operator has no in-kernel normalization under
+    any flag -- seven attributes, none of them an L2 norm or an epsilon -- so
+    the host is the only place it can happen for that arm. ``ascendc`` and
+    ``fla`` both fuse it; the asymmetry is reported rather than evened out, in
+    ``FUSION``.
+    """
+    qf, kf = q.float(), k.float()
+    qf = qf / torch.sqrt((qf * qf).sum(-1, keepdim=True) + 1e-6)
+    kf = kf / torch.sqrt((kf * kf).sum(-1, keepdim=True) + 1e-6)
+    return qf.bfloat16(), kf.bfloat16()
 
 
 def run_ascendc(inputs: Inputs, case: Case):
     """The sglang GLM-5.3 plugin kernel, ``kda_varlen_chunk``.
 
-    No ``prepare_tnd``: this op takes the caller's packed ``[1, T, H, D]``
+    No host preparation: this op takes the caller's packed ``[1, T, H, D]``
     tensors and the raw gate and beta directly, and does the L2 norms, the
-    sigmoids and the bounded gate in its AIV prologue. That is the comparison
-    the benchmark is set up to make -- the preparation is in the timed region
-    for every arm, so fusing it counts.
+    sigmoids and the bounded gate in its AIV prologue. ``fla`` is called the
+    same way and fuses the same three; ``cann`` fuses only the gate, because
+    its operator has no attribute for the other two. Whatever an arm cannot
+    fuse stays in its timed region, which is what makes fusing it count.
 
     Two conversions remain, both of them layout rather than math:
 
@@ -412,8 +437,11 @@ def run_ascendc(inputs: Inputs, case: Case):
       state. ``clone_state`` keeps the K-contiguous backing the op requires.
 
     Returned as ``(attn_out, final_state)`` like the other arms: the output
-    squeezed to ``[T, HV, V]``, and the live slots gathered out of the pool as
-    fp32 ``[N, HV, K, V]``.
+    squeezed to ``[T, HV, V]``, and the live slots as a strided fp32
+    ``[N, HV, K, V]`` view of the pool. A view, not a copy -- this op writes
+    the state where the pool already keeps it, so there is nothing to convert
+    on the way out. The reference arms reach the same layout by taking their
+    contiguous ``[N, HV, V, K]`` state back through ``k_first``.
     """
     if kda_varlen_chunk is None:
         raise NotImplementedError(ASCENDC_ERROR)
@@ -446,8 +474,9 @@ def run_torch(inputs: Inputs, case: Case):
     ``[BT, BT]`` ``A`` column by column and inverts it by forward substitution,
     with O(C^2 K) temporaries -- which is affordable because this is never
     timed. It takes the raw gate and raw beta and does the activation, the
-    sigmoid and the L2 norms itself, so it shares no preparation code with the
-    measured arms; ``prepare_tnd`` is not involved.
+    sigmoid and the L2 norms itself, in ``kda_pre_torch``, so it shares no
+    preparation code with the measured arms -- which is what makes it an
+    independent check on them rather than a restatement of one.
 
     Runs on the NPU, in fp32. Not a compromise on either count:
 
@@ -486,17 +515,43 @@ def run_torch(inputs: Inputs, case: Case):
 
 
 def run_cann(inputs: Inputs, case: Case):
-    """CANN 9.2.0's ``ChunkKdaFwd``, through ``ref_ops``' renamed copy."""
+    """CANN 9.2.0's ``ChunkKdaFwd``, through ``ref_ops``' renamed copy.
+
+    Takes the caller's rank-4 ``[1, T, H, D]`` tensors as ``BSND``, the same
+    ones ``ascendc`` gets, and fuses the one thing this operator can fuse: the
+    bounded gate, from raw ``a`` with ``A_log`` and ``dt_bias``.
+
+    The q/k L2 norm and the beta sigmoid both stay on the host, because this
+    operator cannot do either. Its attribute set is seven entries and none is a
+    normalization, an epsilon, or a sigmoid; ``beta`` is consumed as a plain
+    multiplicative coefficient on every path, so raw logits here would silently
+    compute the wrong thing rather than be activated. That is a real capability
+    gap against the other two arms, so it is reported rather than evened out --
+    see ``FUSION``, which the table prints.
+
+    ``BSND`` rather than ``TND`` is worth 9% at T1024, fading to ~0 by T4096.
+    The L2 normalizes every layout to head-major before launching, and that
+    costs one materialized transpose per tensor it moves: ``TND`` moves five,
+    ``BSND`` moves only ``beta``. Bit-identical either way, measured.
+
+    ``state_v_first`` reads and writes the state in the pool's own
+    K-contiguous orientation, which is the layout the Ascend C op requires --
+    see ``native_live_state``. Also measured bit-identical to the K-first
+    spelling, so it buys the shared layout and nothing else.
+    """
     if ref_cann is None:
         raise NotImplementedError(REF_OPS_ERROR)
-    q, k, v, g, beta, initial_state = prepare_tnd(inputs)
-    return ref_cann.chunk_kda(
-        q, k, v, g, beta,
+    q, k = host_l2norm(inputs.q, inputs.k)
+    attn_out, final_state = ref_cann.chunk_kda(
+        q, k, inputs.v, inputs.a, torch.sigmoid(inputs.b.float()),
+        layout="BSND",
         scale=SCALE, chunk_size=case.chunk_size, cu_seqlens=inputs.cu_seqlens,
         A_log=inputs.A_log, dt_bias=inputs.dt_bias,
-        initial_state=initial_state, safe_gate=SAFE_GATE,
-        lower_bound=LOWER_BOUND, use_gate_in_kernel=USE_GATE_IN_KERNEL,
+        initial_state=native_live_state(inputs.state, inputs.indices),
+        safe_gate=SAFE_GATE, lower_bound=LOWER_BOUND,
+        use_gate_in_kernel=USE_GATE_IN_KERNEL, state_v_first=True,
     )
+    return attn_out.squeeze(0), k_first(final_state)
 
 
 def run_fla(inputs: Inputs, case: Case):
@@ -506,24 +561,69 @@ def run_fla(inputs: Inputs, case: Case):
     ``gk``/``Aqk``/``Akk`` intermediates, which are mandatory outputs and are
     computed either way, so dropping the references to them here changes what
     is read, not what is paid for.
+
+    This arm takes exactly what ``ascendc`` takes -- the caller's rank-4
+    ``[1, T, H, D]`` tensors as ``BSND``, raw q/k, raw gate, raw beta logits --
+    and fuses all of it: both L2 norms under ``use_qk_l2norm_in_kernel``, the
+    beta sigmoid under ``use_beta_sigmoid_in_kernel``, and the bounded gate
+    under ``use_gate_in_kernel``. So no host preparation at all, which is the
+    comparison this benchmark is for.
+
+    The file used to claim fla's in-kernel path "refuses every chunk size but
+    64" as the reason for normalizing on the host. The constraint is real but
+    it is the opposite of a blocker here: C64 is the only size this benchmark
+    runs, and the only one ``ascendc`` supports. Measured against the
+    host-prepared spelling the fused one agrees to 6.1e-5 and runs 2.12 ms
+    against 2.77 ms at H8 T1024 -- so the host form was charging this arm ~24%
+    for work the target fuses.
+
+    ``state_v_first`` for the same reason as in ``run_cann``, and with the same
+    measured result -- bit-identical to the K-first spelling, so the flag buys
+    the shared layout and nothing else.
     """
     if ref_fla is None:
         raise NotImplementedError(REF_OPS_ERROR)
-    q, k, v, g, beta, initial_state = prepare_tnd(inputs)
     out = ref_fla.chunk_kda(
-        q, k, v, g, beta, SCALE, case.chunk_size,
-        layout="TND", cu_seqlens=inputs.cu_seqlens, output_final_state=True,
-        initial_state=initial_state, safe_gate=SAFE_GATE,
-        lower_bound=LOWER_BOUND, use_gate_in_kernel=USE_GATE_IN_KERNEL,
+        inputs.q, inputs.k, inputs.v, inputs.a, inputs.b,
+        SCALE, case.chunk_size,
+        layout="BSND", cu_seqlens=inputs.cu_seqlens, output_final_state=True,
+        initial_state=native_live_state(inputs.state, inputs.indices),
+        safe_gate=SAFE_GATE, lower_bound=LOWER_BOUND,
+        use_gate_in_kernel=USE_GATE_IN_KERNEL,
+        use_qk_l2norm_in_kernel=True, use_beta_sigmoid_in_kernel=True,
         A_log=inputs.A_log, dt_bias=inputs.dt_bias,
+        state_v_first=True,
     )
-    return out[0], out[1]
+    return out[0].squeeze(0), k_first(out[1])
 
 
 ARMS: dict[str, Callable[[Inputs, Case], tuple]] = {
     "ascendc": run_ascendc,
     "cann": run_cann,
     "fla": run_fla,
+}
+
+# What each arm does inside its own kernel, out of the work the deployed prefill
+# has to do per call. Printed under the table, because it is the one thing that
+# stops the latency column from being read as a like-for-like race.
+#
+# Every arm is handed the same raw rank-4 [1,T,H,D] tensors and the same raw
+# gate, beta and state pool. Two of the three fuse everything from there.
+# `cann`'s operator cannot: its seven attributes include the bounded gate but
+# no L2 norm, no epsilon and no beta sigmoid, and `beta` is a plain coefficient
+# on every kernel path -- so that arm alone pays `host_l2norm` and a host
+# sigmoid, inside its timed region. There is no flag, no sibling op and no
+# second entry point that closes the gap: `recurrent_kda` has both flags but is
+# the decode kernel, and `kda_input_proj` sigmoids beta but is the projection
+# stage and subsumes the GEMMs.
+#
+# So the `cann` column is its honest end-to-end cost on these inputs, not its
+# kernel in isolation. The handicap was measured at ~0.1 ms of 0.87 ms at
+# T1024, shrinking with T.
+FUSION: dict[str, str] = {
+    "ascendc": "L2 norms + beta sigmoid + bounded gate, all in kernel",
+    "cann": "bounded gate in kernel; L2 norms + beta sigmoid on host (no flag exists)",
+    "fla": "L2 norms + beta sigmoid + bounded gate, all in kernel",
 }
 
 # The arm speedups are quoted against. The reference arms are the bar, not the
@@ -773,8 +873,8 @@ def print_table(rows, target_name: str, reference_names: list[str]):
     arms = [
         ("ascendc", "the sglang GLM-5.3 plugin kernel, written here;\n"
                     "chunk size fixed at 64, so '-' on the C128 rows"),
-        ("cann", "CANN 9.2.0 ChunkKdaFwd, via ref_ops.cann"),
-        ("fla", "flash-linear-attention-npu, via ref_ops.fla_npu;\n"
+        ("cann", "CANN 9.2.0 ChunkKdaFwd, via ref_ops.cann; BSND"),
+        ("fla", "flash-linear-attention-npu, via ref_ops.fla_npu; BSND;\n"
                 "chunk_size=64 only, so '-' on the C128 rows"),
     ]
     # Describe only the arms this table has columns for.
@@ -796,6 +896,16 @@ def print_table(rows, target_name: str, reference_names: list[str]):
         print(f"{name.ljust(pad)} : {head}")
         for line in rest:
             print(f"{' ' * pad}   {line}")
+
+    # Every arm is handed the same raw inputs; they differ in how much of the
+    # preparation each can fuse. `cann` cannot fuse the L2 norms or the beta
+    # sigmoid -- no attribute exists -- so its column includes host work the
+    # other two do on-chip. Printed with the table so the latency column is not
+    # read as like-for-like.
+    print()
+    print("what each arm fuses, from identical raw inputs:")
+    for name, text in arms:
+        print(f"{name.ljust(pad)} : {FUSION[name]}")
 
 
 def main() -> None:

@@ -140,6 +140,25 @@ set(_SRC_kda_varlen_recurrent
 set(_SRC_kda_varlen_chunk
     csrc/kda/kda_varlen_chunk.cpp
     csrc/kda/kda_varlen_chunk_kernel.cpp)
+
+# Which triangular inverse the chunk kernel uses. `substitution` is the
+# default and what the header picks on its own; `squaring` selects the
+# original repeated-squaring path, which is kept compilable so the two can be
+# measured against each other.
+set(KDA_CHUNK_INVERSE "substitution" CACHE STRING
+    "Triangular inverse for kda_varlen_chunk: substitution or squaring")
+set_property(CACHE KDA_CHUNK_INVERSE PROPERTY STRINGS substitution squaring)
+if(KDA_CHUNK_INVERSE STREQUAL "squaring")
+    add_compile_definitions(KDA_CHUNK_INVERSE_SQUARING=1)
+    message(STATUS "kda_varlen_chunk inverse: repeated squaring")
+elseif(KDA_CHUNK_INVERSE STREQUAL "substitution")
+    add_compile_definitions(KDA_CHUNK_INVERSE_SQUARING=0)
+    message(STATUS "kda_varlen_chunk inverse: blocked forward substitution")
+else()
+    message(FATAL_ERROR
+        "KDA_CHUNK_INVERSE must be 'substitution' or 'squaring', got "
+        "'${KDA_CHUNK_INVERSE}'")
+endif()
 set(_SRC_reduce                csrc/reduce/reduce_sum.cpp)
 
 foreach(_NAME IN LISTS _ALL_KERNEL_NAMES)
