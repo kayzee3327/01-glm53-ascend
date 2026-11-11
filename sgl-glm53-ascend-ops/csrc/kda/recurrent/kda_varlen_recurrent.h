@@ -21,6 +21,13 @@
 // validation, so there is one definition of the only supported shape.
 constexpr int64_t config_D = 128;
 
+// 32-byte alignment helper for UB buffer offsets. Previously in csrc/include/
+// utils.h, relocated here when that header was retired.
+__aicore__ inline constexpr uint32_t Align32(uint32_t x)
+{
+    return (x + 31u) & ~31u;
+}
+
 namespace kda_prefill {
 
 constexpr uint32_t kNumVectorCores = 40;

@@ -24,6 +24,52 @@ def prepared_recurrent(
     )
 
 
+def kda_varlen_recurrent_v2(
+    *,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b: torch.Tensor,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float,
+    scale: float,
+    intermediate_state: Optional[torch.Tensor] = None,
+    prefill: bool = False,
+    track_state_indices: Optional[torch.Tensor] = None,
+    track_state_lens: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """In-development v2 of the recurrent KDA kernel.
+
+    Interface identical to :func:`kda_varlen_recurrent`. Registered under
+    ``kda_varlen_recurrent_v2`` until cutover; at that point the C++ registration
+    string is changed to ``kda_varlen_recurrent`` and this wrapper is removed,
+    so all call sites using :func:`kda_varlen_recurrent` pick up v2 automatically.
+    """
+    return torch.ops.sgl_glm53_ascend.kda_varlen_recurrent_v2(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=initial_state_source,
+        initial_state_indices=initial_state_indices,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+        scale=scale,
+        intermediate_state=intermediate_state,
+        prefill=prefill,
+        track_state_indices=track_state_indices,
+        track_state_lens=track_state_lens,
+    )
+
+
 def kda_varlen_recurrent(
     *,
     A_log: torch.Tensor,
@@ -81,6 +127,50 @@ def kda_varlen_recurrent(
         lower_bound=lower_bound,
         scale=scale,
         intermediate_state=intermediate_state,
+        prefill=prefill,
+        track_state_indices=track_state_indices,
+        track_state_lens=track_state_lens,
+    )
+
+
+def kda_varlen_chunk_v2(
+    *,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b: torch.Tensor,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float,
+    scale: float,
+    prefill: bool = False,
+    track_state_indices: Optional[torch.Tensor] = None,
+    track_state_lens: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """In-development v2 of the chunked KDA kernel.
+
+    Interface identical to :func:`kda_varlen_chunk`. Registered under
+    ``kda_varlen_chunk_v2`` until cutover; at that point the C++ registration
+    string is changed to ``kda_varlen_chunk`` and this wrapper is removed,
+    so all call sites using :func:`kda_varlen_chunk` pick up v2 automatically.
+    """
+    return torch.ops.sgl_glm53_ascend.kda_varlen_chunk_v2(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=initial_state_source,
+        initial_state_indices=initial_state_indices,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+        scale=scale,
         prefill=prefill,
         track_state_indices=track_state_indices,
         track_state_lens=track_state_lens,

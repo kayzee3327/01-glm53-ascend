@@ -112,11 +112,12 @@ set(SGL_OPS "" CACHE STRING
 # ---------------------------------------------------------------------------
 # Kernel definitions — one per independently developed operator
 # ---------------------------------------------------------------------------
-set(_ALL_KERNEL_NAMES helloworld prepared_recurrent kda_varlen_recurrent
-    kda_varlen_chunk reduce)
+set(_ALL_KERNEL_NAMES namespace_reg prepared_recurrent kda_varlen_recurrent
+    kda_varlen_recurrent_v2 kda_varlen_chunk kda_varlen_chunk_v2)
 
 set(_SRC_helloworld            csrc/helloworld/helloworld.cpp)
 set(_SRC_prepared_recurrent    csrc/kda/prepared_recurrent.cpp)
+set(_SRC_namespace_reg         csrc/sgl_glm53_ascend_ops.cpp)
 # kda_varlen_recurrent is one operator across several translation units: the
 # host op (validation, dispatch, registration) plus one file per kernel, since
 # prefill H4/H8 and decode H16/H32/H64 each want their own tiling and block
@@ -127,20 +128,29 @@ set(_SRC_prepared_recurrent    csrc/kda/prepared_recurrent.cpp)
 # csrc/kda/kda_varlen_recurrent_decode.h; H32 carries its own copy of the
 # implementation, because it is the priority decode shape and is tuned alone.
 set(_SRC_kda_varlen_recurrent
-    csrc/kda/kda_varlen_recurrent.cpp
-    csrc/kda/kda_varlen_recurrent_prefill_h4.cpp
-    csrc/kda/kda_varlen_recurrent_prefill_h8.cpp
-    csrc/kda/kda_varlen_recurrent_decode_h16.cpp
-    csrc/kda/kda_varlen_recurrent_decode_h32.cpp
-    csrc/kda/kda_varlen_recurrent_decode_h64.cpp)
+    csrc/kda/recurrent/kda_varlen_recurrent.cpp
+    csrc/kda/recurrent/kda_varlen_recurrent_prefill_h4.cpp
+    csrc/kda/recurrent/kda_varlen_recurrent_prefill_h8.cpp
+    csrc/kda/recurrent/kda_varlen_recurrent_decode_h16.cpp
+    csrc/kda/recurrent/kda_varlen_recurrent_decode_h32.cpp
+    csrc/kda/recurrent/kda_varlen_recurrent_decode_h64.cpp)
+# kda_varlen_recurrent_v2: in-development replacement for kda_varlen_recurrent.
+# Single kernel handles all prefill/decode widths; see recurrent_v2/.
+set(_SRC_kda_varlen_recurrent_v2
+    csrc/kda/recurrent_v2/kda_varlen_recurrent_v2.cpp
+    csrc/kda/recurrent_v2/kda_varlen_recurrent_v2_kernel.cpp)
 # kda_varlen_chunk is the chunked form of the same operator: the host op plus
 # one MIX kernel (one Cube block and two Vector blocks per (sequence, head)).
 # Two translation units because the host TU includes torch and the device TU
 # cannot.
 set(_SRC_kda_varlen_chunk
-    csrc/kda/kda_varlen_chunk.cpp
-    csrc/kda/kda_varlen_chunk_kernel.cpp)
-
+    csrc/kda/chunk/kda_varlen_chunk.cpp
+    csrc/kda/chunk/kda_varlen_chunk_kernel.cpp)
+# kda_varlen_chunk_v2: in-development replacement for kda_varlen_chunk.
+# Registered as kda_varlen_chunk_v2 until cutover; see chunk_v2/kda_varlen_chunk_v2.cpp.
+set(_SRC_kda_varlen_chunk_v2
+    csrc/kda/chunk_v2/kda_varlen_chunk_v2.cpp
+    csrc/kda/chunk_v2/kda_varlen_chunk_v2_kernel.cpp)
 # Which triangular inverse the chunk kernel uses. `substitution` is the
 # default and what the header picks on its own; `squaring` selects the
 # original repeated-squaring path, which is kept compilable so the two can be
@@ -159,7 +169,6 @@ else()
         "KDA_CHUNK_INVERSE must be 'substitution' or 'squaring', got "
         "'${KDA_CHUNK_INVERSE}'")
 endif()
-set(_SRC_reduce                csrc/reduce/reduce_sum.cpp)
 
 foreach(_NAME IN LISTS _ALL_KERNEL_NAMES)
     if(SGL_OPS AND NOT "${_NAME}" IN_LIST SGL_OPS)

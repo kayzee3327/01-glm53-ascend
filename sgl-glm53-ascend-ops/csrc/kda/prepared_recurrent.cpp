@@ -1,5 +1,4 @@
 #include "kernel_operator.h"
-#include "utils.h"
 
 #ifndef __CCE_KT_TEST__
 #include <acl/acl.h>

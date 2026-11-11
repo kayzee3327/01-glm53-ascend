@@ -4,7 +4,6 @@
 
 #include "kernel_operator.h"
 #include "kda_varlen_recurrent.h"
-#include "utils.h"
 
 namespace kda_decode {
 

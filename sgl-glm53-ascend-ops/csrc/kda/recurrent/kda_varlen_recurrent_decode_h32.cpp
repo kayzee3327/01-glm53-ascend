@@ -14,7 +14,6 @@
 
 #include "kernel_operator.h"
 #include "kda_varlen_recurrent.h"
-#include "utils.h"
 
 #ifndef __CCE_KT_TEST__
 #include <acl/acl.h>
